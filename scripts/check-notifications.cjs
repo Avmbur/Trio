@@ -1,0 +1,28 @@
+// Real notification UI in an isolated VS Code profile; no model turns.
+const fs=require('fs'),path=require('path'),os=require('os'),{spawn,execFileSync}=require('child_process');
+async function main(){
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'trio-notification-check-'));
+ const workspace=path.join(root,'workspace'),userData=path.join(root,'profile'),extensions=path.join(root,'extensions'),harness=path.join(root,'harness');
+ for(const d of [workspace,userData,extensions,harness])fs.mkdirSync(d,{recursive:true});
+ const resultFile=path.join(root,'result.json');
+ fs.writeFileSync(path.join(harness,'package.json'),JSON.stringify({name:'trio-notification-check',publisher:'trio-test',version:'0.0.1',engines:{vscode:'^1.95.0'},main:'main.cjs',activationEvents:['onStartupFinished']}));
+ fs.writeFileSync(path.join(harness,'main.cjs'),'const resultFile='+JSON.stringify(resultFile)+';\n'+"\nconst vscode=require('vscode'),fs=require('fs'),path=require('path'),assert=require('assert/strict');\nconst pause=ms=>new Promise(r=>setTimeout(r,ms));\nasync function until(fn,label){const end=Date.now()+15000;while(!fn()){if(Date.now()>end)throw Error('Timeout: '+label);await pause(100);}}\nexports.activate=async()=>{\n let captured;\n const evidence=[];\n const ext=vscode.extensions.getExtension('trio-local.trio-chat');\n const mod=require(path.join(ext.extensionPath,'dist/orchestrator/controller'));\n const Original=mod.Controller;\n mod.Controller=class extends Original{constructor(...a){super(...a);captured=this;}};\n try{\n  await ext.activate();\n  for(const m of Object.values(require.cache).filter(m=>/[/\\\\]dist[/\\\\]orchestrator[/\\\\]controller\\.js$/i.test(m.filename))){\n    const Base=m.exports.Controller;m.exports.Controller=class extends Base{constructor(...a){super(...a);captured=this;}};\n  }\n  await vscode.commands.executeCommand('trio.open');\n  await until(()=>!!captured,'controller');\n  const tabs=()=>vscode.window.tabGroups.all.flatMap(g=>g.tabs).filter(t=>/^Trio(?: |$)/.test(t.label));\n  await until(()=>tabs().length===1,'single Trio tab');\n  const scratch=await vscode.workspace.openTextDocument({content:'Temporary notification test'});\n  async function leave(){\n   const group=vscode.window.tabGroups.all.find(g=>g.tabs.some(t=>/^Trio(?: |$)/.test(t.label)));\n   await vscode.window.showTextDocument(scratch,{viewColumn:group.viewColumn,preview:false});\n   await until(()=>!tabs()[0].isActive,'Trio inactive');\n  }\n  async function accept(){\n   await vscode.commands.executeCommand('notifications.focusToasts');\n   await pause(200);\n   await vscode.commands.executeCommand('notification.acceptPrimaryAction');\n   await until(()=>tabs()[0]?.isActive&&tabs()[0].label==='Trio','Open Trio action');\n  }\n  for(const kind of ['done','permission']){\n   await leave();captured.host.notify(kind,'Trio QA '+kind);\n   await until(()=>tabs()[0].label==='Trio ●','unread marker');\n   evidence.push({kind,beforeClick:tabs()[0].label});\n   await pause(300);await accept();\n   evidence.at(-1).afterClick=tabs()[0].label;\n  }\n  await leave();captured.host.notify('done','Trio QA return');\n  await until(()=>tabs()[0].label==='Trio ●','marker before returning');\n  await vscode.commands.executeCommand('notifications.hideToasts');\n  assert.equal(tabs()[0].label,'Trio ●','dismissing toast keeps marker');\n  await vscode.commands.executeCommand('trio.open');\n  await until(()=>tabs()[0].label==='Trio','manual return clears marker');\n  await vscode.workspace.getConfiguration('trio').update('notify',false,vscode.ConfigurationTarget.Global);\n  await leave();captured.host.notify('done','Suppressed test');await pause(400);\n  assert.notEqual(tabs()[0].label,'Trio ●','notifications setting respected');\n  assert.equal(captured.state.turns.length,0,'No agent turns');\n  fs.writeFileSync(resultFile,JSON.stringify({ok:true,version:ext.packageJSON.version,evidence,dismissKeepsMarker:true,returnClearsMarker:true,disabledSetting:true,modelCalls:0},null,2));\n }catch(e){\n  fs.writeFileSync(resultFile,JSON.stringify({ok:false,error:String(e),evidence,tabs:vscode.window.tabGroups.all.flatMap(g=>g.tabs).map(t=>({label:t.label,active:t.isActive})),captured:!!captured},null,2));\n }finally{mod.Controller=Original;}\n};\n");
+ const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
+ const child=spawn(process.env.TRIO_TEST_VSCODE||'C:/Program Files/Microsoft VS Code/Code.exe',[
+  '--user-data-dir',userData,'--extensions-dir',extensions,'--disable-extensions','--disable-workspace-trust','--skip-welcome','--skip-release-notes','--new-window',
+  '--extensionDevelopmentPath='+path.resolve(__dirname,'..'),'--extensionDevelopmentPath='+harness,workspace],
+  {env,windowsHide:true,stdio:['ignore','pipe','pipe']});
+ let error,output='';child.on('error',e=>error=e);child.stdout.on('data',d=>output+=d);child.stderr.on('data',d=>output+=d);
+ console.log('Isolated notification test: '+root);
+ try{
+  const end=Date.now()+70000;
+  while(!fs.existsSync(resultFile)){if(error)throw error;if(Date.now()>end)throw Error('Timeout: '+output.slice(-1500));await new Promise(r=>setTimeout(r,200));}
+  const result=JSON.parse(fs.readFileSync(resultFile,'utf8'));
+  const evidence=path.resolve('.protocol-tmp/workflows');fs.mkdirSync(evidence,{recursive:true});fs.copyFileSync(resultFile,path.join(evidence,'notifications.json'));
+  console.log(JSON.stringify(result));if(!result.ok)process.exitCode=1;
+ }finally{
+  if(child.pid){try{execFileSync('taskkill',['/PID',String(child.pid),'/T','/F'],{windowsHide:true,stdio:'ignore'});}catch{}}
+  child.stdout.destroy();child.stderr.destroy();child.unref();
+ }
+}
+main().catch(e=>{console.error(e);process.exitCode=1;});

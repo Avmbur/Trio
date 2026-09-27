@@ -1,0 +1,235 @@
+{
+  "name": "trio-chat",
+  "displayName": "Trio",
+  "description": "Общий чат с Claude Code, Codex и Grok; передачей слова управляет человек.",
+  "version": "1.0.0",
+  "publisher": "trio-local",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Avmbur/Trio.git"
+  },
+  "homepage": "https://github.com/Avmbur/Trio#readme",
+  "bugs": {
+    "url": "https://github.com/Avmbur/Trio/issues"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onCommand:trio.open",
+    "onWebviewPanel:trio"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Запуск CLI требует доверия к рабочей папке."
+    },
+    "virtualWorkspaces": false
+  },
+  "scripts": {
+    "build": "tsc -p . && node scripts/build-native.cjs",
+    "test": "npm run build && node --test --test-concurrency=1 tests/*.test.cjs",
+    "check:release": "node scripts/check-release.cjs",
+    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository --no-rewrite-relative-links --skip-license"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "trio.open",
+        "title": "Trio: Открыть чат"
+      },
+      {
+        "command": "trio.stop.all",
+        "title": "Trio: Стоп — всем"
+      },
+      {
+        "command": "trio.stop.claude",
+        "title": "Trio: Стоп — Колян"
+      },
+      {
+        "command": "trio.stop.codex",
+        "title": "Trio: Стоп — Жека"
+      },
+      {
+        "command": "trio.stop.grok",
+        "title": "Trio: Стоп — Гриха"
+      },
+      {
+        "command": "trio.refresh",
+        "title": "Trio: Восстановить панель"
+      },
+      {
+        "command": "trio.popout",
+        "title": "Trio: Перенести в отдельное окно"
+      }
+    ],
+    "configuration": [
+      {
+        "title": "Trio: CLI",
+        "order": 1,
+        "properties": {
+        "trio.claudePath": {
+          "type": "string",
+          "order": 1,
+          "default": "claude",
+          "markdownDescription": "Путь к Claude CLI Коляна (`.exe` или npm-launcher). Пустое или `claude` — поиск в официальном расширении Claude Code, затем в PATH. Меняйте, только если CLI стоит нестандартно. Неверный путь: Колян не запустится, Диагностика покажет ошибку."
+        },
+        "trio.codexPath": {
+          "type": "string",
+          "order": 2,
+          "default": "codex",
+          "markdownDescription": "Путь к Codex CLI Жеки (`.exe` или npm-launcher). Пустое или `codex` — поиск в официальном расширении Codex, затем в PATH. Неверный путь: Жека не запустится."
+        },
+        "trio.grokPath": {
+          "type": "string",
+          "order": 3,
+          "default": "grok",
+          "markdownDescription": "Путь к официальному Grok CLI Грихи (`.exe`). По умолчанию `%USERPROFILE%\\\\.grok\\\\bin\\\\grok.exe`, иначе имя `grok` в PATH. Нужен и для ответа, и для Диагностики. Неверный путь: Гриха не запустится."
+        }
+        }
+      },
+      {
+        "title": "Trio: потолок сессии",
+        "order": 2,
+        "properties": {
+        "trio.claudeSessionMaxTokens": {
+          "type": "integer",
+          "order": 1,
+          "default": 150000,
+          "minimum": 0,
+          "markdownDescription": "Если полоска окна **Коляна** выше этого числа токенов, следующий ход — новая сессия CLI, а не `--resume`. По умолчанию 150 000. 0 — без потолка. Не даёт кэшу Claude расти дальше."
+        },
+        "trio.codexSessionMaxTokens": {
+          "type": "integer",
+          "order": 2,
+          "default": 150000,
+          "minimum": 0,
+          "markdownDescription": "Если полоска окна **Жеки** выше этого числа токенов, следующий ход — новая сессия CLI, а не `--resume`. По умолчанию 150 000. 0 — без потолка."
+        },
+        "trio.grokSessionMaxTokens": {
+          "type": "integer",
+          "order": 3,
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "Если полоска окна **Грихи** выше этого числа токенов, следующий ход — новая сессия CLI, а не `--resume`. По умолчанию 0 — без потолка: его CLI сам сжимает окно около 80% от 500 000. Поставь число, если нужно рвать сессию раньше."
+        }
+        }
+      },
+      {
+        "title": "Trio: лента",
+        "order": 3,
+        "properties": {
+        "trio.contextChars": {
+          "type": "integer",
+          "order": 1,
+          "default": 64000,
+          "minimum": 1000,
+          "markdownDescription": "Сколько **символов ленты Trio** вкладывать в один запрос к CLI (история + текущее поручение и вложения). По умолчанию 64 000.\n\n**Это не полоска «Контекст» на карточке.** Полоска — окно самого движка в токенах (у Коляна около 1 000 000, у Грихи около 500 000). Это поле режет только текст, который Trio дописывает в промпт.\n\n**Увеличить.** В запрос влезет больше ранней переписки. Если сессия CLI уже живая, лишнее обычно не шлётся (дельта). Но после сжатия, сброса или первого хода в сессию уходит вся оставшаяся лента **до этого лимита** — большее число быстрее забивает окно движка и чаще вызывает автосжатие.\n\n**Уменьшить.** Ранние сообщения Trio отбросит раньше (в промпте будет пометка, сколько не влезло). Короткий вопрос пройдёт. Слишком длинное поручение или пачка вложений **не отправится**, черновик останется.\n\nОдно сообщение с вложениями всё равно не может быть длиннее этого числа. Минимум 1000."
+        },
+        "trio.collapseMessageLines": {
+          "type": "integer",
+          "order": 2,
+          "default": 100,
+          "minimum": 0,
+          "markdownDescription": "Сообщение длиннее этого числа строк лента сворачивает в треугольник: видно начало и «· раскрыть». По умолчанию 100. **0 — не сворачивать никогда.**\n\nСчитаются строки текста, а не высота на экране: таблица на 30 рядов или нумерованный список дают много строк при небольшом виде. Если длинные ответы прячутся чаще, чем хочется, — поднять до 200–300.\n\nОтдельно действует потолок по длине: сообщение длиннее 6000 символов сворачивается независимо от этого числа."
+        }
+        }
+      },
+      {
+        "title": "Trio: ход",
+        "order": 4,
+        "properties": {
+        "trio.discussionTimeoutSeconds": {
+          "type": "integer",
+          "order": 1,
+          "default": 600,
+          "minimum": 1,
+          "markdownDescription": "Тишина CLI в режиме **Чтение** (секунды). По умолчанию 600 (10 минут). Счётчик сбрасывается, пока движок пишет или вызывает инструменты; пауза, пока Trio ждёт тебя. Если молчит дольше — процесс останавливается, частичный ответ сохраняется. На режим Правок не влияет."
+        },
+        "trio.executionTimeoutSeconds": {
+          "type": "integer",
+          "order": 2,
+          "default": 1800,
+          "minimum": 1,
+          "markdownDescription": "Тишина CLI в режиме **Правки** (секунды). По умолчанию 1800 (30 минут). Как у Чтения: живой поток не обрывает ход. Тем же числом ограничен запуск CLI для списка моделей."
+        },
+        "trio.turnCeilingMinutes": {
+          "type": "integer",
+          "order": 3,
+          "default": 60,
+          "minimum": 1,
+          "markdownDescription": "Потолок длительности хода (минуты), даже если CLI не молчит. По умолчанию 60. Зависший процесс, который продолжает слать прогресс, всё равно снимут. Частичный ответ и уже сделанные правки остаются."
+        },
+        "trio.notify": {
+          "type": "boolean",
+          "order": 4,
+          "default": true,
+          "markdownDescription": "Тост VS Code, когда ход закончился или агент ждёт разрешения, а панель Trio не в фокусе. Сообщение с кнопкой «Открыть Trio» не гаснет само. Выключи, если не хочешь всплывающих сообщений."
+        },
+        "trio.sessionIdleMinutes": {
+          "type": "integer",
+          "order": 5,
+          "default": 55,
+          "minimum": 0,
+          "markdownDescription": "Если с прошлого хода участника прошло столько минут, следующий ход идёт в **новой сессии CLI**, а не `--resume`. По умолчанию 55: кэш Claude живёт час, и после паузы иначе переписывается весь накопленный контекст. 0 — не сбрасывать по простою. Лента Trio уходит один раз, до `trio.contextChars`."
+        }
+        }
+      },
+      {
+        "title": "Trio: снимок правок",
+        "order": 5,
+        "properties": {
+        "trio.snapshotStorageMiB": {
+  "type": "number",
+  "order": 0,
+  "scope": "application",
+  "default": 1024,
+  "minimum": 1,
+  "markdownDescription": "Общий лимит снимков всех проектов Trio (МиБ). По умолчанию 1024 (1 ГиБ). Одинаковое содержимое хранится один раз. При превышении удаляются самые старые снимки: их diff становится недоступен, рабочие файлы и переписка сохраняются. Снимки активных ходов защищены и могут временно превысить лимит; уборка повторяется после завершения. Учитываются и старые снимки; картинки, архивы переписки и прочие данные расширения в лимит не входят. Настройка общая для всех окон, задаётся на уровне пользователя."
+},
+        "trio.snapshotFileMiB": {
+          "type": "number",
+          "order": 1,
+          "default": 20,
+          "minimum": 0.001,
+          "markdownDescription": "Максимальный размер **одного файла** (МиБ) в снимке проекта перед ходом в режиме Правок. Крупнее — в снимок не попадёт, в «Изменения файлов» его не сравнить. Уменьшение экономит место и время снимка, но большие файлы выпадут из diff."
+        },
+        "trio.snapshotTotalMiB": {
+          "type": "number",
+          "order": 2,
+          "default": 200,
+          "minimum": 0.001,
+          "markdownDescription": "Потолок **суммарного** размера снимка (МиБ). Когда набор файлов его превосходит, обход останавливается, часть проекта в снимок не войдёт. Уменьшение ускоряет старт правки ценой неполного diff."
+        },
+        "trio.snapshotMaxFiles": {
+          "type": "integer",
+          "order": 3,
+          "default": 20000,
+          "minimum": 1,
+          "markdownDescription": "Максимум файлов в снимке. Дальше обход обрывается. Имеет смысл уменьшить на огромных репозиториях, если снимок перед Правками тормозит."
+        },
+        "trio.snapshotExcludes": {
+          "type": "array",
+          "order": 4,
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Дополнительные каталоги или относительные пути, которые **не** класть в снимок. Имена или пути от корня проекта, **также поддерживается маска расширения `*.vsix`** (`node_modules`, `dist`, `secret/keys`). Системный мусор Trio и так пропускает. Ошибка в имени никого не исключит — файл попадёт в снимок."
+        }
+        }
+      }
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.7.0",
+    "@vscode/vsce": "^3.0.0"
+  }
+}

@@ -1,0 +1,11 @@
+const {execFileSync} = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+if (process.platform !== 'win32') throw new Error('Trio builds its native helper on Windows.');
+const root = path.resolve(__dirname, '..');
+const output = path.join(root, 'dist', 'native', 'JobRunner.exe');
+const source = path.join(root, 'native', 'JobRunner.cs');
+fs.mkdirSync(path.dirname(output), {recursive: true});
+if (fs.existsSync(output) && fs.statSync(output).mtimeMs >= fs.statSync(source).mtimeMs) process.exit(0);
+const compiler = path.join(process.env.WINDIR || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+execFileSync(compiler, ['/nologo', '/target:exe', '/out:' + output, source], {cwd: root, stdio: 'inherit', windowsHide: true});

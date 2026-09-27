@@ -1,0 +1,24 @@
+{
+  "rateLimits": {
+    "limitId": "codex",
+    "primary": {"usedPercent": 41, "windowDurationMins": 10080, "resetsAt": 1893456000}
+  },
+  "rateLimitsByLimitId": {
+    "codex_bengalfox": {
+      "limitId": "codex_bengalfox",
+      "limitName": "GPT-5.3-Codex-Spark",
+      "primary": {"usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1893456000},
+      "secondary": {"usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 1893974400}
+    },
+    "codex": {
+      "limitId": "codex",
+      "primary": {"usedPercent": 43, "windowDurationMins": 10080, "resetsAt": 1893456000}
+    },
+    "base_model_inference": {
+      "limitId": "base_model_inference",
+      "limitName": "gpt-reserve",
+      "normalModelSlug": "gpt-5.6-luna",
+      "primary": {"usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 1893974400}
+    }
+  }
+}

@@ -1,0 +1,20 @@
+# Собирается командой npm run build; в историю не кладём.
+dist/
+node_modules/
+
+# Пакеты выпуска копятся в git; каждый добавляют принудительно (git add -f).
+*.vsix
+
+# Локальные настройки инструментов и временные файлы проверок.
+.claude/
+.codex/
+.vscode/
+.protocol-tmp/
+*.log
+
+# Черновики и старый чат: в git не кладём.
+old/
+WORKLOG.md
+spec.md
+backlog.md
+трио.txt

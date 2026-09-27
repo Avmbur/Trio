@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Trio — макет общего чата</title>
+  <link rel="stylesheet" href="preview.css">
+  <script src="preview-model.js" defer></script>
+  <script src="preview.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><strong>trio</strong><span class="divider"></span><span class="workspace">Общий разговор</span></div>
+      <div class="top-actions"><span class="demo-badge">ИНТЕРАКТИВНЫЙ МАКЕТ</span><button id="popout" title="Открыть этот макет в отдельном окне">↗ <span>Отдельное окно</span></button></div>
+    </header>
+    <div class="demo-note">Ответы здесь демонстрационные. Агенты не подключены, файлы проекта не изменяются.</div>
+    <section class="chat-header" aria-label="Управление перепиской">
+      <div><p class="eyebrow">РАБОТАЕМ ВМЕСТЕ</p><h1>Один разговор. Вся команда.</h1><p class="subtitle">Ты решаешь, кто отвечает и кому поручить работу.</p></div>
+      <div class="chat-actions"><button id="search-toggle" aria-expanded="false">Поиск</button><button id="export">Экспорт</button><button id="reset">Новый пример</button></div>
+    </section>
+    <div id="search-box" class="search-box" hidden><label for="search">Найти в переписке</label><input id="search" type="search" placeholder="Текст или имя участника"><span id="search-count"></span></div>
+    <main id="feed" class="feed" aria-label="Общая переписка" tabindex="0"></main>
+    <button id="latest" class="latest" hidden>↓ К последнему сообщению</button>
+    <section class="bottom">
+      <div class="floor"><div class="floor-label"><span id="floor-dot" class="floor-dot"></span><strong id="floor-title">Слово у тебя</strong><span id="floor-detail">Следующий участник ждёт твоей команды</span></div><div id="handoffs" class="handoffs"></div></div>
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+      <div id="queued" class="queued" hidden></div>
+      <div id="agents" class="agents" aria-label="Участники разговора"></div>
+      <form id="composer" class="composer">
+        <label class="sr-only" for="draft">Сообщение в общий чат</label>
+        <textarea id="draft" rows="2" placeholder="Напиши сообщение или поручение: «Колян, делай…»"></textarea>
+        <div class="composer-tools"><div class="compose-left"><label for="recipient">Кому</label><select id="recipient"></select><span class="shared-hint">Видно всем участникам</span></div><div class="compose-right"><button id="stop-all" type="button" class="stop-all">■ Стоп всем</button><button id="send" type="submit" class="primary">Отправить ↑</button></div></div>
+      </form>
+      <div class="footnote"><span>Enter — отправить · Shift+Enter — новая строка</span><span>Макет · без обращений к моделям</span></div>
+    </section>
+  </div>
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <form id="settings-form"><div class="dialog-header"><div><p class="eyebrow">УЧАСТНИК</p><h2 id="settings-title"></h2></div><button type="button" id="close-settings" aria-label="Закрыть настройки">✕</button></div>
+      <p class="dialog-note">Пример органов управления. Настройки сохраняются только в этом макете.</p>
+      <label for="model">Модель</label><input id="model" maxlength="80" placeholder="По умолчанию"><p class="field-help">Список доступных моделей появится после подключения движка.</p>
+      <label for="mode">Режим</label><select id="mode"><option>Обсуждение</option><option>Выполнение</option></select>
+      <label for="effort">Усилие рассуждения</label><select id="effort"><option>По умолчанию</option><option>Низкое</option><option>Среднее</option><option>Высокое</option></select><p class="field-help">Набор параметров у реальных агентов будет различаться.</p>
+      <div class="subscription"><span>Способ подключения</span><strong>По подписке</strong><small>Автоматический переход на платный API исключён.</small></div>
+      <button type="submit" class="primary save-settings">Сохранить в макете</button>
+    </form>
+  </dialog>
+  <dialog id="reset-dialog" aria-labelledby="reset-title"><h2 id="reset-title">Начать пример заново?</h2><p>Переписка и настройки этого макета будут сброшены. Можно сначала сохранить переписку кнопкой «Экспорт».</p><div class="dialog-actions"><button id="cancel-reset">Отмена</button><button id="confirm-reset" class="primary">Начать заново</button></div></dialog>
+</body>
+</html>

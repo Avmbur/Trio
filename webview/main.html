@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-{{nonce}}'; style-src {{cspSource}} 'nonce-{{nonce}}'; img-src {{cspSource}} data: https: vscode-resource: vscode-webview-resource:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Trio {{version}}</title>
+  <link rel="stylesheet" href="{{css}}">
+  <script nonce="{{nonce}}" src="{{composer}}" defer></script>
+  <script nonce="{{nonce}}" src="{{script}}" defer></script>
+</head>
+<body>
+  <div class="app">
+    <header class="toolbar">
+      <strong>Trio</strong><span id="app-version" title="Версия загруженного расширения">v{{version}}</span>
+      <div class="project-slot"><button id="project" class="project-path" type="button" hidden>Проект: …</button></div>
+      <nav aria-label="Управление чатом">
+        <button id="search-toggle" aria-expanded="false" title="Найти по ленте: подсветка совпадений, счётчик, переход стрелками и Enter, Esc закрывает. Номер сообщения: #1, #25 и т.п.">Поиск</button>
+        <button id="export" title="Сохранить всю ленту в Markdown-файл: сообщения, ошибки и пометки о частичных ответах">Экспорт</button><button id="import" title="Прочитать ленту из Markdown-файла в текущий разговор. Агентов не запускает, повторно ничего не отвечает">Импорт</button>
+        <button id="swap-panels" title="Поменять переписку и управление местами">⇄ Панели</button>
+        <div class="more-menu"><button id="more-toggle" aria-expanded="false" aria-controls="more-actions" title="Дополнительно">⋯</button>
+          <div id="more-actions" class="menu-actions" hidden>
+            <button id="plugin-settings" title="Открыть настройки расширения Trio: trio.contextChars, таймауты, пути CLI">Настройки плагина</button>
+            <button id="settings" title="Пути к Claude CLI и Codex CLI">CLI</button>
+            <button id="diagnostics">Диагностика</button>
+            <button id="creator" title="От создателя">От создателя</button>
+          </div>
+        </div>
+        <button id="reconnect" title="Восстановить интерфейс без сброса разговора">↻</button>
+        <button id="popout" title="Перенести эту вкладку в отдельное окно">↗ Окно</button>
+        <span id="detached-label" hidden>Отдельное окно</span>
+      </nav>
+    </header>
+    <div id="connection" class="connection" role="status">Подключение к Trio…</div>
+    <div id="layout" class="layout">
+      <section class="chat-pane" aria-label="Разговор">
+        <div id="search-box" class="search-box" hidden>
+          <label class="sr-only" for="search">Найти в переписке</label><input id="search" type="search" placeholder="Найти в переписке или сообщение по номеру #1, #25 и т.п.">
+          <span id="search-count" aria-live="polite"></span>
+          <button id="search-prev" title="Предыдущее совпадение (Shift+Enter)">↑</button>
+          <button id="search-next" title="Следующее совпадение (Enter)">↓</button>
+          <button id="search-close" title="Закрыть поиск (Esc)">✕</button>
+        </div>
+        <main id="feed" class="feed" aria-label="Переписка" tabindex="0"></main>
+        <button id="latest" class="latest" hidden>↓ Последнее</button>
+        <form id="composer" class="composer">
+          <p class="composer-hint">Shift+Enter — новая строка · Enter — отправить</p>
+          <label class="sr-only" for="draft">Сообщение</label>
+          <textarea id="draft" rows="3" placeholder="Сообщение…" disabled></textarea>
+          <div id="attachments" class="attachments"></div>
+          <div class="recipients-row"><span>Отвечают:</span><div id="response-order" role="group" aria-label="Кому и в каком порядке отвечать"></div>
+            <button id="auto-reply" type="button" aria-pressed="false" title="Следующие вопросы тоже пойдут сами, пока флаг включён. Ошибка, лимит или Стоп одному — слово тебе. Стоп всем гасит флаг.">Автоответ</button>
+            <button id="auto-edits" type="button" aria-pressed="false" title="Чтение и запись файлов без окна. Нужен режим Правок. Удаление, сеть и команды всё равно спросят.">+правки</button>
+            <button id="auto-commands" type="button" aria-pressed="false" title="Тесты, tsc, сборка, обычный Bash без окна. Git-коммит, push, удаление и сеть спросят. Нужны Правки.">+команды</button>
+          </div>
+          <div id="composer-tools" class="composer-tools">
+            <button id="attach" type="button" class="attach" title="Прикрепить выделение, открытый файл или любой другой файл" disabled>+ Код…</button>
+            <span id="order-hint"></span><span class="spacer"></span>
+            <div class="snippets-wrap">
+              <button id="snippets-toggle" type="button" aria-expanded="false" aria-controls="snippets-panel" title="Вставить сохранённый текст в поле. Не отправляет.">Заготовки ▾</button>
+              <div id="snippets-panel" hidden>
+                <p class="snippets-hint">Ctrl+Z в поле — отменить вставку</p>
+                <div class="snippets-toolbar">
+                  <label class="sr-only" for="snippets-filter">Найти заготовку</label>
+                  <input id="snippets-filter" type="search" placeholder="Найти или новый текст">
+                  <span id="snippets-empty-hint" class="snippet-empty" hidden>Пока пусто</span>
+                  <button id="snippets-from-field" type="button" title="Сохранить как заготовку: эта строка или поле сообщения">+</button>
+                </div>
+                <div id="snippets-list" role="listbox" aria-label="Заготовки"></div>
+              </div>
+            </div>
+            <button id="discuss" type="button" aria-pressed="false" title="Этот вопрос — только обсуждение, даже если в карточке включены Правки. В конец допишется «обсуждаем, код не трогать».">Обсуждаем</button>
+            <button id="send" type="submit" class="primary" disabled>Отправить</button>
+          </div>
+          <p id="delta-hint" class="delta-hint" hidden></p>
+        </form>
+      </section>
+      <div id="panel-divider" class="panel-divider" role="separator" tabindex="0" aria-label="Ширина панели управления" aria-orientation="vertical" aria-valuemin="380" aria-valuemax="600" aria-valuenow="400"></div>
+      <aside id="controls-pane" class="controls-pane" aria-label="Управление">
+        <section class="control-block"><div id="agents" class="agents"></div></section>
+        <section class="control-block">
+          <section class="block-part">
+            <div class="work-head">
+              <h2>Работа:</h2>
+              <button id="auto-reply-work" type="button" aria-pressed="false" title="Следующие вопросы тоже пойдут сами. Стоп одному останавливает цепочку, Стоп всем гасит флаг.">Авто</button>
+              <button id="stop-all" type="button" disabled title="Остановить работающего и выключить автоответ">■ Стоп всем</button>
+            </div>
+            <div class="floor"><span id="floor-dot" class="floor-dot"></span><strong id="floor-title">Подключение…</strong></div>
+            <div id="floor-detail"></div>
+          </section>
+          <section class="block-part queue-part">
+            <h2 class="plain">Очередь ответов</h2>
+            <div class="queue-slot">
+              <p id="queue-empty" class="empty">Нет ожидающих ответов.</p>
+              <div id="queued" class="queued" hidden></div>
+            </div>
+            <details id="older-queue" class="older-queue" hidden><summary id="older-summary">Другие ожидающие вопросы</summary><div id="older-rows"></div></details>
+          </section>
+          <section class="block-part">
+            <h2 class="plain">Параметры разговора</h2>
+            <div class="conversation-actions">
+              <button id="compact-all" title="Сжать контекст всем: каждый движок сожмёт свою историю сам. Лента Trio не меняется. Это обращение к модели.">Сжать</button>
+              <button id="reset-context" title="Сбросить контекст всем: история на экране останется, но агенты начнут с чистой сессии и её не получат. Ожидающие ответы будут сняты. Файлы проекта не трогаем.">Сбросить</button>
+              <button id="new-conversation" title="Новый разговор: лента, черновик, очередь и сессии очищаются, настройки участников остаются. Лента уйдёт в архив Trio, файлы проекта не трогаем. Нужен второй клик.">Новый</button>
+              <button id="archives" title="Открыть папку архивов Trio вне проекта: туда уходит лента перед очисткой">Архив</button>
+            </div>
+          </section>
+        </section>
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden><div id="notice-text" class="notice-text" title="Показать целиком"></div><button id="notice-close" class="notice-close" type="button" title="Закрыть" aria-label="Закрыть">×</button></div>
+      </aside>
+    </div>
+    <dialog id="creator-dialog" aria-labelledby="creator-title">
+      <div class="mhead">
+        <div class="mhead-text">
+          <h3 id="creator-title">AVMBUR</h3>
+          <div class="meta">NetMonitor · 1.0 · 27.09.2026</div>
+        </div>
+        <button type="button" id="creator-close" class="mx" title="закрыть">×</button>
+      </div>
+      <div class="mbody">
+        <div class="brand-intro">
+          <figure class="brand-picture">
+            <img src="{{creatorImage}}" alt="Кепка">
+          </figure>
+          <div class="brand-text">Изначально делал этот софт как вспомогательный инструмент
+             в разработке <a href="https://www.e-msu.ru" target="_blank" rel="noopener noreferrer">электронного местного самоуправления</a>, но потом он
+             мне показался вполне самодостаточным. И оказался очень удобным инструментом!
+             Получилось вполне удачно на мой взгляд. Работать с Коляном (Claude), Жекой (От ChatGPT:)) и Грихой(Grok) - оказалось очень удобно.
+             Софт для тех, кто понимает, зачем использовать несколько нейросетей одновременно.</div>
+        </div>
+        <div class="brand-links">
+          <a href="https://vk.com/antoonvm" target="_blank" rel="noopener noreferrer">ВКонтакте</a>
+          <a href="https://github.com/Avmbur" target="_blank" rel="noopener noreferrer">GitHub</a>
+          <a href="https://t.me/neocortex38" target="_blank" rel="noopener noreferrer">Telegram</a>
+        </div>
+      </div>
+    </dialog>
+    <dialog id="usage-dialog" aria-labelledby="usage-title">
+      <div class="dialog-header"><h2 id="usage-title">Расход</h2><button id="usage-close" type="button">Закрыть</button></div>
+      <div id="usage-body"></div>
+    </dialog>
+    <dialog id="image-dialog" aria-label="Скриншот">
+      <img id="image-full" alt="">
+      <div class="dialog-actions">
+        <button id="image-save" type="button">Сохранить</button>
+        <button id="image-close" type="button">Закрыть</button>
+      </div>
+    </dialog>
+    <dialog id="permission-dialog" aria-labelledby="permission-title">
+      <h2 id="permission-title">Разрешение</h2>
+      <p id="permission-who"></p>
+      <p id="permission-what"></p>
+      <details id="permission-more"><summary tabindex="-1">Подробности запроса</summary><pre id="permission-detail"></pre></details>
+      <div class="dialog-actions">
+        <button id="permission-once" type="button" class="primary">Разрешить один раз</button>
+        <button id="permission-whole" type="button">Разрешить на весь ход</button>
+        <button id="permission-standing" type="button" title="Любой такой же запрос этого участника до конца разговора. Для ssh — любая команда на этот хост. Опасные (rm, git commit, сеть) так не разрешить.">Разрешить до конца разговора</button>
+        <button id="permission-deny" type="button">Отказать</button>
+      </div>
+    </dialog>
+    <dialog id="instruction-dialog" aria-labelledby="instruction-dialog-title">
+      <h2 id="instruction-dialog-title">Инструкция</h2>
+      <label class="sr-only" for="instruction-text">Текст инструкции</label>
+      <textarea id="instruction-text" rows="6" maxlength="1000"></textarea>
+      <p id="instruction-count"></p>
+      <div class="dialog-actions">
+        <button id="instruction-clear" type="button">Очистить</button>
+        <button id="instruction-cancel" type="button">Отмена</button>
+        <button id="instruction-save" type="button" class="primary">Сохранить</button>
+      </div>
+    </dialog>
+    <dialog id="snippet-dialog" aria-labelledby="snippet-dialog-title">
+      <h2 id="snippet-dialog-title">Заготовка</h2>
+      <label for="snippet-name">Название</label>
+      <input id="snippet-name" maxlength="80" autocomplete="off">
+      <label for="snippet-text">Текст</label>
+      <textarea id="snippet-text" rows="6" maxlength="20000"></textarea>
+      <label id="snippet-flags-label"><input id="snippet-keep-flags" type="checkbox"> Запомнить флаги</label>
+      <p id="snippet-flags-hint"></p>
+      <div class="dialog-actions">
+        <button id="snippet-delete" type="button">Удалить</button>
+        <button id="snippet-duplicate" type="button">Дублировать</button>
+        <button id="snippet-cancel" type="button">Отмена</button>
+        <button id="snippet-save" type="button" class="primary">Сохранить</button>
+      </div>
+    </dialog>
+    <dialog id="question-dialog" aria-labelledby="question-title">
+      <div class="question-header">
+        <h2 id="question-title">Вопрос</h2>
+        <p id="question-who"></p>
+      </div>
+      <div id="question-body"></div>
+      <div id="question-actions" class="dialog-actions">
+        <button id="question-deny" type="button">Отмена</button>
+      </div>
+    </dialog>
+  </div>
+</body>
+</html>
