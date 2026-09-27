@@ -351,15 +351,32 @@ export function questionNumber(messages: Message[], turns: {messageId: string}[]
     .findIndex(m => m.id === messageId);
   return i < 0 ? 0 : i + 1;
 }
-function speaker(m: Message, messages: Message[], turns: {messageId: string}[]): string {
-  const n = m.author === 'Антон' ? questionNumber(messages, turns, m.id) : 0;
-  return (n ? m.author + ' #' + n : m.author)
+// #К #Ж #Г count each author's replies in feed order. A question card is not a reply.
+const replyMarks: Partial<Record<Message['author'], string>> = {Колян: 'К', Жека: 'Ж', Гриха: 'Г'};
+export function replyNumber(messages: Message[], turns: {replyId?: string}[], messageId: string): number {
+  const message = messages.find(m => m.id === messageId);
+  if (!message || !replyMarks[message.author]) return 0;
+  const i = messages.filter(m => m.author === message.author && turns.some(t => t.replyId === m.id))
+    .findIndex(m => m.id === messageId);
+  return i < 0 ? 0 : i + 1;
+}
+export function messageMark(messages: Message[], turns: {messageId: string; replyId?: string}[], messageId: string): string {
+  const question = questionNumber(messages, turns, messageId);
+  if (question) return '#' + question;
+  const message = messages.find(m => m.id === messageId);
+  const n = replyNumber(messages, turns, messageId);
+  const mark = message && replyMarks[message.author];
+  return n && mark ? '#' + mark + n : '';
+}
+function speaker(m: Message, messages: Message[], turns: {messageId: string; replyId?: string}[]): string {
+  const mark = messageMark(messages, turns, m.id);
+  return (mark ? m.author + ' ' + mark : m.author)
     + (m.partial ? ' [частичный ответ]' : '')
     + (m.cancelled ? ' [снят]' : '')
     + (m.error ? ' [ошибка]' : '');
 }
 export function contextFit(messages: Message[], current: string, limit: number,
-    catalog?: {messages: Message[]; turns: {messageId: string}[]}): {text: string; omitted: number; shown: number} {
+    catalog?: {messages: Message[]; turns: {messageId: string; replyId?: string}[]}): {text: string; omitted: number; shown: number} {
   if (current.length > limit) throw new Error('Поручение превышает trio.contextChars. Увеличьте лимит или сократите сообщение.');
   const all = catalog?.messages ?? messages;
   const turns = catalog?.turns ?? [];
@@ -375,7 +392,7 @@ export function contextFit(messages: Message[], current: string, limit: number,
   };
 }
 export function context(messages: Message[], current: string, limit: number,
-    catalog?: {messages: Message[]; turns: {messageId: string}[]}): string {
+    catalog?: {messages: Message[]; turns: {messageId: string; replyId?: string}[]}): string {
   return contextFit(messages, current, limit, catalog).text;
 }
 export type Input =

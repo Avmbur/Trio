@@ -120,17 +120,17 @@
       const row = rows.get(message.id);
       if (!row) continue;
       const running = active?.turnId === message.turn && message.author !== 'Антон';
-      const group = state.turns.filter(t => t.messageId === message.id);
+      const group = feedIndex.byMessage.get(message.id) || [];
       const cancelled = !!message.cancelled || (message.author === 'Антон' && group.length > 0
         && !group.some(t => t.executor) && group.every(t => t.status === 'interrupted'));
-      const turn = state.turns.find(t => t.id === message.turn);
+      const turn = message.turn ? feedIndex.byTurnId.get(message.turn) : undefined;
       const status = row.querySelector('.message-status');
       if (status) status.textContent = statusLine(message, running, turn, cancelled);
       const stamp = row.querySelector('.message-stamp');
       if (stamp) paintStamp(stamp, message, turn);
     }
     if (active && !(permissions || []).length && !compacting && !state.messages.some(m => m.question && !m.question.answered)) {
-      const live = state.turns.find(t => t.id === active.turnId);
+      const live = feedIndex.byTurnId.get(active.turnId);
       const liveTime = turnElapsed(live, true);
       $('floor-title').textContent = answeringLine(state, active, liveTime);
     }
@@ -656,21 +656,65 @@
     const cycle = live?.cycle > 1 ? ' · цикл ' + live.cycle : '';
     return names[active.provider] + ' отвечает' + (liveTime ? ' · ' + liveTime : '') + cycle;
   }
-  // Keep in sync with questionNumber in src/shared/model.ts — panel and prompt share the count.
-  function questionNumber(state, messageId) {
-    return state.messages.filter(m => m.author === 'Антон' && state.turns.some(t => t.messageId === m.id)).findIndex(m => m.id === messageId) + 1;
-  }
-  function questionRefs(state) {
+  // Keep in sync with questionNumber, replyNumber and messageMark in src/shared/model.ts.
+  // One pass per paint. Recounting every card against the whole feed froze typing.
+  const replyMarks = {Колян: 'К', Жека: 'Ж', Гриха: 'Г'};
+  let feedLabels = new Map();
+  let feedIndex = {byMessage: new Map(), byTurnId: new Map()};
+  function indexFeed(state) {
     const refs = new Map();
-    if (!state) return refs;
-    const withTurn = new Set();
-    for (const turn of state.turns) if (turn.messageId) withTurn.add(turn.messageId);
+    const labels = new Map();
+    const byMessage = new Map();
+    const byReply = new Map();
+    const byTurnId = new Map();
+    feedLabels = labels;
+    if (!state) return {refs, byMessage, byReply, byTurnId};
+    for (const turn of state.turns) {
+      byTurnId.set(turn.id, turn);
+      if (turn.messageId) {
+        const list = byMessage.get(turn.messageId);
+        if (list) list.push(turn); else byMessage.set(turn.messageId, [turn]);
+      }
+      if (turn.replyId) {
+        const list = byReply.get(turn.replyId);
+        if (list) list.push(turn); else byReply.set(turn.replyId, [turn]);
+      }
+    }
     let n = 0;
-    for (const message of state.messages)
-      if (message.author === 'Антон' && withTurn.has(message.id)) refs.set(++n, message.id);
-    return refs;
+    const counts = {Колян: 0, Жека: 0, Гриха: 0};
+    for (const message of state.messages) {
+      const label = {};
+      if (message.author === 'Антон' && byMessage.has(message.id)) {
+        label.question = ++n;
+        refs.set(String(n), message.id);
+      }
+      const mark = replyMarks[message.author];
+      if (mark && byReply.has(message.id)) {
+        const num = ++counts[message.author];
+        label.reply = '#' + mark + num;
+        refs.set(mark + num, message.id);
+      }
+      if (label.question || label.reply) labels.set(message.id, label);
+    }
+    return {refs, byMessage, byReply, byTurnId};
   }
-  // #25 in a reply jumps to that message. #250 and v#25 stay text: the digits have to stand alone.
+  function questionNumber(state, messageId) {
+    return feedLabels.get(messageId)?.question || 0;
+  }
+  function replyLabel(state, messageId) {
+    return feedLabels.get(messageId)?.reply || '';
+  }
+  function turnsFor(index, messageId) {
+    const tasks = [];
+    const seen = new Set();
+    for (const turn of [...(index.byMessage.get(messageId) || []), ...(index.byReply.get(messageId) || [])]) {
+      if (seen.has(turn.id)) continue;
+      seen.add(turn.id);
+      tasks.push(turn);
+    }
+    return tasks;
+  }
+  // #25 and #К76 jump to that message. #250, #К760 and v#25 stay text: the token has to stand alone.
   function paintCell(tag, className, text) {
     const node = element(tag, className);
     if (!paintLinked(node, text)) node.textContent = text;
@@ -678,21 +722,26 @@
   }
   function paintLinked(parent, text) {
     if (!liveRefs.size || !text || !text.includes('#')) return false;
-    const re = /#\d+/g;
+    const re = /#(?:[КЖГкжг]\d+|\d+)/g;
     let match, start = 0, linked = false;
     const nodes = [];
     while ((match = re.exec(text))) {
+      const token = match[0];
       const prev = match.index ? text[match.index - 1] : '';
-      const next = text[match.index + match[0].length] || '';
-      if (/[0-9A-Za-z_]/.test(prev) || /[0-9A-Za-z_]/.test(next)) continue;
-      if (!/^#(?:0|[1-9]\d*)$/.test(match[0])) continue;
-      const id = liveRefs.get(Number(match[0].slice(1)));
+      const next = text[match.index + token.length] || '';
+      const letter = /^#[КЖГкжг]/.test(token);
+      const stuck = letter ? /[\p{L}\p{N}_]/u : /[0-9A-Za-z_]/;
+      if (stuck.test(prev) || stuck.test(next)) continue;
+      const parsed = /^#([КЖГкжг])?(0|[1-9]\d*)$/.exec(token);
+      if (!parsed) continue;
+      const key = (parsed[1] ? parsed[1].toUpperCase() : '') + parsed[2];
+      const id = liveRefs.get(key);
       if (!id) continue;
       if (match.index > start) nodes.push(element('span', '', text.slice(start, match.index)));
-      const link = button(match[0], () => revealQuestion(id), false, 'msg-ref');
-      link.title = 'К сообщению ' + match[0];
+      const link = button('#' + key, () => revealQuestion(id), false, 'msg-ref');
+      link.title = 'К сообщению #' + key;
       nodes.push(link);
-      start = match.index + match[0].length;
+      start = match.index + token.length;
       linked = true;
     }
     if (!linked) return false;
@@ -757,8 +806,10 @@
   function render() {
     if (!snapshot) return;
     const {state, active, progress, permissions, compacting} = snapshot, busy = !!active || resetPending || !!compacting;
-    liveRefs = questionRefs(state);
-    const refKey = [...liveRefs.values()].join('\n');
+    const indexed = indexFeed(state);
+    feedIndex = indexed;
+    liveRefs = indexed.refs;
+    const refKey = [...liveRefs.entries()].map(([key, id]) => key + '=' + id).join('\n');
     const feed = $('feed'), nearEnd = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 90;
     const query = $('search-box').hidden ? '' : $('search').value;
     const currentIds = new Set(state.messages.map(m => m.id));
@@ -767,6 +818,9 @@
     if (!state.messages.length) {
       if (!feed.querySelector('.empty')) feed.append(element('p', 'empty', 'Нет сообщений.'));
     } else feed.querySelector('.empty')?.remove();
+    // Saved order wins. A reply stored beside its question must not stay at the
+    // end just because that card was created after later questions were painted.
+    let previous = null;
     for (const message of state.messages) {
       let row = rows.get(message.id);
       if (!row) {
@@ -775,10 +829,13 @@
         head.append(element('strong', '', message.author), element('span', 'message-status'), element('span', 'message-stamp'));
         const content = element('div', 'message-content');
         content.append(element('ol', 'message-trace'), element('div', 'message-body'), element('div', 'message-attachments'), element('div', 'message-tools'));
-        row.append(head, content); feed.append(row); rows.set(message.id, row);
+        row.append(head, content); rows.set(message.id, row);
       }
+      const next = previous ? previous.nextElementSibling : feed.firstElementChild;
+      if (row !== next) feed.insertBefore(row, next);
+      previous = row;
       const running = active?.turnId === message.turn && message.author !== 'Антон';
-      const group = state.turns.filter(t => t.messageId === message.id);
+      const group = indexed.byMessage.get(message.id) || [];
       const cancelled = !!message.cancelled || (message.author === 'Антон' && group.length > 0
         && !group.some(t => t.executor) && group.every(t => t.status === 'interrupted'));
       row.className = 'message ' + (authors[message.author] || '') + (running ? ' active' : '')
@@ -790,7 +847,7 @@
         // A changed folding threshold has to repaint bodies that are already on screen.
         + '\0' + (snapshot?.collapseLines ?? '')
         // A reply that names #25 stays plain until that message exists, then grows a link.
-        + (/#\d+/.test(message.text || '') ? '\0' + refKey : '');
+        + (/#/.test(message.text || '') ? '\0' + refKey : '');
       if (body.dataset.text !== bodyKey) {
         body.dataset.text = bodyKey;
         if (message.question) showQuestion(body, message);
@@ -804,7 +861,7 @@
         files.dataset.key = attachmentKey; files.replaceChildren(...(message.attachments || []).map(a => attachmentView(a)));
       }
       const status = row.querySelector('.message-status');
-      const turn = state.turns.find(t => t.id === message.turn);
+      const turn = message.turn ? indexed.byTurnId.get(message.turn) : undefined;
       status.textContent = statusLine(message, running, turn, cancelled);
       paintStamp(row.querySelector('.message-stamp'), message, turn);
       const traceBox = row.querySelector('.message-trace');
@@ -824,13 +881,25 @@
         }
       }
       const tools = row.querySelector('.message-tools');
-      const tasks = state.turns.filter(t => t.messageId === message.id || t.replyId === message.id);
-      const toolsKey = JSON.stringify(tasks);
+      const tasks = turnsFor(indexed, message.id);
+      const ownNo = message.author === 'Антон' && tasks.length ? '#' + questionNumber(state, message.id) : '';
+      const replyNo = replyLabel(state, message.id);
+      const answered = replyNo ? tasks.find(t => t.replyId === message.id) : undefined;
+      const questionNo = answered ? questionNumber(state, answered.messageId) : 0;
+      const toolsKey = ownNo + '\0' + replyNo + '\0' + questionNo + '\0' + JSON.stringify(tasks);
       if (tools.dataset.key !== toolsKey) {
         tools.dataset.key = toolsKey; tools.replaceChildren();
-        if (message.author === 'Антон' && tasks.length) {
+        if (ownNo) {
           const pending = tasks.filter(t => state.queue.includes(t.id)).length;
-          tools.append(element('span', 'question-no', '#' + questionNumber(state, message.id) + (pending ? ' · ожидает ответа: ' + pending : '')));
+          tools.append(element('span', 'question-no', ownNo + (pending ? ' · ожидает ответа: ' + pending : '')));
+        }
+        if (replyNo) {
+          tools.append(element('span', 'question-no', replyNo));
+          if (questionNo) {
+            const back = button('На вопрос #' + questionNo, () => revealQuestion(answered.messageId), false, 'answer-ref');
+            back.title = 'К вопросу #' + questionNo;
+            tools.append(back);
+          }
         }
         for (const task of tasks.filter(t => t.snapshot && (t.replyId === message.id || !t.replyId))) {
           if (task.status === 'running' || task.status === 'preparing')
@@ -1493,8 +1562,8 @@
       (host || target).scrollIntoView({block: 'center'});
     }
   }
-  // #138 is a message number. #1380 is a different one, so the digits have to end.
-  function questionQuery(term) {return /^#\d+$/.test(term);}
+  // #138 and #К76 are message numbers. #1380 and #К760 are different ones, so the digits have to end.
+  function numberQuery(term) {return /^#[кжг]?\d+$/u.test(term);}
   function hideFromSearch(node) {
     const parent = node.parentElement;
     if (!parent || !parent.closest) return false;
@@ -1508,7 +1577,8 @@
     clearTimeout(searchTimer);
     const typed = $('search-box').hidden ? '' : $('search').value.toLowerCase();
     const trimmed = typed.trim();
-    const term = /^#\s*\d+$/.test(trimmed) ? '#' + trimmed.replace(/^#\s*/, '') : typed;
+    const numbered = /^#\s*([кжг])?(\d+)$/u.exec(trimmed);
+    const term = numbered ? '#' + (numbered[1] || '') + numbered[2] : typed;
     const changed = term !== searchTerm;
     clearHighlights(); searchTerm = term;
     if (!term) {searchIndex = -1; selectMatch(false); return;}
@@ -1524,7 +1594,7 @@
       let start = 0, from = 0, at, matched = false;
       while ((at = lower.indexOf(term, from)) >= 0) {
         // Rejecting #2 inside #20 must keep those characters: only the search cursor moves.
-        if (questionQuery(term) && /[0-9]/.test(lower.charAt(at + term.length))) {from = at + 1; continue;}
+        if (numberQuery(term) && /[0-9]/.test(lower.charAt(at + term.length))) {from = at + 1; continue;}
         fragment.append(document.createTextNode(text.slice(start, at)));
         const mark = element('mark', 'search-match', text.slice(at, at + term.length));
         fragment.append(mark); searchMatches.push(mark); start = from = at + term.length; matched = true;
@@ -1534,7 +1604,7 @@
     }
     if (!searchMatches.length) searchIndex = -1;
     else if (changed || searchIndex < 0) {
-      const chip = questionQuery(term) ? searchMatches.findIndex(m => m.parentElement && m.parentElement.closest('.question-no')) : -1;
+      const chip = numberQuery(term) ? searchMatches.findIndex(m => m.parentElement && m.parentElement.closest('.question-no')) : -1;
       searchIndex = chip >= 0 ? chip : 0;
     } else searchIndex = Math.min(searchIndex, searchMatches.length - 1);
     selectMatch(scroll);

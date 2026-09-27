@@ -106,6 +106,8 @@ input,select{background:var(--input);border:1px solid var(--line);padding:5px 7p
 .message-tools:empty{display:none}
 .message-tools button,.message-tools span{font-size:11px;color:var(--muted)}
 .message-tools button:hover{color:var(--accent)}
+.message-tools .answer-ref{color:var(--accent);text-decoration:underline;text-underline-offset:2px;background:transparent}
+.message-tools .answer-ref:hover{color:var(--fg)}
 .message-tools .instruction-used{font-size:11px;color:var(--muted);min-width:0}
 .message-tools .instruction-used[open]{flex:1 0 100%}
 .message-tools .instruction-used>summary{cursor:pointer;color:var(--muted)}

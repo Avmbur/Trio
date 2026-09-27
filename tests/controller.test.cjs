@@ -1149,6 +1149,39 @@ test('context numbers Anton questions from the shared function',()=>{
  assert.match(text,/Антон #2 \[снят\]: two/);
  assert.match(text,/Текущее поручение Антона:\nnow/);
 });
+test('reply marks are per author and reach the prompt',()=>{
+ const {replyNumber,messageMark,context}=require('../dist/shared/model');
+ const messages=[
+  {id:'q',author:'Антон',text:'q'},
+  {id:'k',author:'Колян',text:'one'},
+  {id:'card',author:'Колян',text:'вопрос?'},
+  {id:'z',author:'Жека',text:'two'},
+  {id:'k2',author:'Колян',text:'three'},
+  {id:'g',author:'Гриха',text:'four'}
+ ];
+ const turns=[
+  {messageId:'q',replyId:'k'},
+  {messageId:'q',replyId:'z'},
+  {messageId:'q',replyId:'k2'},
+  {messageId:'q',replyId:'g'}
+ ];
+ assert.equal(replyNumber(messages,turns,'k'),1);
+ assert.equal(replyNumber(messages,turns,'k2'),2);
+ assert.equal(replyNumber(messages,turns,'z'),1);
+ assert.equal(replyNumber(messages,turns,'g'),1);
+ assert.equal(replyNumber(messages,turns,'card'),0);
+ assert.equal(messageMark(messages,turns,'q'),'#1');
+ assert.equal(messageMark(messages,turns,'k'),'#К1');
+ assert.equal(messageMark(messages,turns,'z'),'#Ж1');
+ assert.equal(messageMark(messages,turns,'g'),'#Г1');
+ const text=context(messages,'now',64000,{messages,turns});
+ assert.match(text,/Антон #1: q/);
+ assert.match(text,/Колян #К1: one/);
+ assert.match(text,/Колян: вопрос\?/);
+ assert.match(text,/Жека #Ж1: two/);
+ assert.match(text,/Колян #К2: three/);
+ assert.match(text,/Гриха #Г1: four/);
+});
 test('unapproved questions and attachments do not enter another question context',async t=>{
  const {c,state,runs}=await fixture(t);
  await c.send('PENDING_QUESTION','all',[],[{id:'old',label:'old.ts',text:'PENDING_CODE'}]);

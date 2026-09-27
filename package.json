@@ -2,7 +2,7 @@
   "name": "trio-chat",
   "displayName": "Trio",
   "description": "Общий чат с Claude Code, Codex и Grok; передачей слова управляет человек.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "trio-local",
   "license": "AGPL-3.0-only",
   "repository": {

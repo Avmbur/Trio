@@ -67,7 +67,23 @@ function webview() {
         contains:name=>tokens().includes(name)
       };
     }
-    append(...children) {for(const child of children){child.parent=this;child.parentNode=this;child.parentElement=this;this.children.push(child);}}
+    append(...children) {for(const child of children) this.insertBefore(child, null);}
+    get firstElementChild() {return this.children[0] || null;}
+    get nextElementSibling() {
+      const kids = this.parent?.children || [];
+      const at = kids.indexOf(this);
+      return at < 0 ? null : kids[at + 1] || null;
+    }
+    insertBefore(node, before) {
+      if (node.parent) node.parent.children = node.parent.children.filter(c => c !== node);
+      node.parent = this; node.parentNode = this; node.parentElement = this;
+      if (before == null) this.children.push(node);
+      else {
+        const at = this.children.indexOf(before);
+        if (at < 0) this.children.push(node); else this.children.splice(at, 0, node);
+      }
+      return node;
+    }
     addEventListener(name, fn) {this.listeners[name]=fn;}
     click() {if(!this.disabled)this.onclick?.();}
     replaceChildren(...children) {this.children=[];this.childNodes=null;this.append(...children);}
@@ -523,6 +539,105 @@ test('a cited #number opens that message, and a longer or fenced number stays te
  const row2=nodes.feed.children.find(n=>n.dataset.messageId==='q2');
  assert.equal(row2.scrolled,true);
  assert.equal(row2.querySelector('.long-message').open,true);
+});
+test('agent replies are #К #Ж #Г and link back to the question',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,publish}=webview();
+ const state=fresh();
+ state.messages=[
+  {id:'q1',author:'Антон',text:'первый',turn:'t1'},
+  {id:'a1',author:'Колян',text:'см. #ж1 и #К2 и #К10 и v#К1\n```\n#К1\n```\n| n |\n|---|\n| #К1 |',turn:'t1'},
+  {id:'q2',author:'Антон',text:'второй',turn:'t2'},
+  {id:'a2',author:'Жека',text:'ответ жеки',turn:'t2'},
+  {id:'a3',author:'Колян',text:'ещё',turn:'t3'},
+  {id:'g',author:'Гриха',text:'третье мнение',turn:'t4'}
+ ];
+ state.turns=[
+  {id:'t1',messageId:'q1',replyId:'a1',recipient:'claude',status:'completed',executor:'claude'},
+  {id:'t2',messageId:'q2',replyId:'a2',recipient:'codex',status:'completed',executor:'codex'},
+  {id:'t3',messageId:'q1',replyId:'a3',recipient:'claude',status:'completed',executor:'claude'},
+  {id:'t4',messageId:'q2',replyId:'g',recipient:'grok',status:'completed',executor:'grok'}
+ ];
+ publish(state);
+ const row=id=>nodes.feed.children.find(n=>n.dataset.messageId===id);
+ const chip=id=>collect(row(id).querySelector('.message-tools'),'question-no').map(n=>n.textContent);
+ assert.deepEqual(chip('q1'),['#1']);
+ assert.deepEqual(chip('a1'),['#К1']);
+ assert.deepEqual(chip('a2'),['#Ж1']);
+ assert.deepEqual(chip('a3'),['#К2']);
+ assert.deepEqual(chip('g'),['#Г1']);
+ const back=id=>collect(row(id).querySelector('.message-tools'),'answer-ref');
+ assert.equal(back('a1')[0].textContent,'На вопрос #1');
+ assert.equal(back('a3')[0].textContent,'На вопрос #1');
+ assert.equal(back('g')[0].textContent,'На вопрос #2');
+ assert.equal(back('a2')[0].title,'К вопросу #2');
+ back('a3')[0].onclick();
+ assert.equal(row('q1').scrolled,true);
+ const refs=()=>collect(row('a1').querySelector('.message-body'),'msg-ref').map(n=>n.textContent);
+ assert.deepEqual(refs(),['#Ж1','#К2','#К1']);
+ const fence=[...row('a1').querySelector('.message-body').querySelectorAll('.md-run')].find(n=>(n.textContent||'').includes('#К1'));
+ assert.ok(fence);
+ assert.equal(collect(fence,'msg-ref').length,0);
+ const link=collect(row('a1').querySelector('.message-body'),'msg-ref').find(n=>n.textContent==='#К2');
+ assert.equal(link.title,'К сообщению #К2');
+ link.onclick();
+ assert.equal(row('a3').scrolled,true);
+ const marks=()=>{
+  const out=[];
+  const walk=n=>{
+   if((n.className||'').split(' ').includes('search-match')) out.push(n.textContent);
+   const nested=n.childNodes&&n.childNodes.length?n.childNodes:(n.children||[]);
+   for(const c of nested) walk(c);
+  };
+  walk(nodes.feed);
+  return out;
+ };
+ const landed=()=>nodes.feed.children.filter(n=>n.scrolled).map(n=>n.dataset.messageId);
+ const clearScrolled=n=>{n.scrolled=false; for(const c of n.children||[]) clearScrolled(c);};
+ const find=term=>{
+  clearScrolled(nodes.feed);
+  nodes['search-box'].hidden=false;
+  nodes.search.value=term;
+  nodes.search.oninput();
+ };
+ find('# К2');
+ assert.equal(nodes['search-count'].textContent,'2 / 2');
+ assert.deepEqual(landed(),['a3']);
+ assert.deepEqual(marks(),['#К2','#К2']);
+ find('#К10');
+ assert.equal(nodes['search-count'].textContent,'1 / 1');
+ assert.deepEqual(marks(),['#К10']);
+ assert.deepEqual(landed(),[]);
+ find('#Г1');
+ assert.deepEqual(landed(),['g']);
+});
+test('a late answer is painted beside its question, not after newer ones',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,publish}=webview();
+ const state=fresh();
+ state.messages=[
+  {id:'q1',author:'Антон',text:'один',turn:'t1'},
+  {id:'q2',author:'Антон',text:'два',turn:'t2'},
+  {id:'q3',author:'Антон',text:'три',turn:'t3'}
+ ];
+ state.turns=[
+  {id:'t1',messageId:'q1',recipient:'claude',status:'running',executor:'claude'},
+  {id:'t2',messageId:'q2',recipient:'codex',status:'proposed'},
+  {id:'t3',messageId:'q3',recipient:'grok',status:'proposed'}
+ ];
+ publish(state);
+ const order=()=>nodes.feed.children.filter(n=>n.dataset&&n.dataset.messageId).map(n=>n.dataset.messageId);
+ assert.deepEqual(order(),['q1','q2','q3']);
+ state.messages.splice(1,0,{id:'a1',author:'Колян',text:'ответ на первый',turn:'t1'});
+ state.turns[0].replyId='a1';
+ state.turns[0].status='completed';
+ publish(state);
+ assert.deepEqual(order(),['q1','a1','q2','q3']);
+ state.messages.splice(3,0,{id:'a2',author:'Жека',text:'ответ на второй',turn:'t2'});
+ state.turns[1].replyId='a2';
+ state.turns[1].status='completed';
+ publish(state);
+ assert.deepEqual(order(),['q1','a1','q2','a2','q3']);
 });
 test('a busy next respondent does not get the pulse class',()=>{
  const {fresh}=require('../dist/shared/model');
