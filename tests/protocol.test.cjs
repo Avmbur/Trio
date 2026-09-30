@@ -44,5 +44,5 @@ test('Grok discuss mode denies every tool request without asking Anton',{timeout
   jobRunner:path.resolve('dist/native/JobRunner.exe'),timeout:15000,signal:new AbortController().signal,
   onPid:async()=>{},onSession:async()=>{},text:()=>{},progress:()=>{},
   permission:async()=>{asked++;return true;}});
- assert.equal(asked,0);assert.equal(result.text,'Начало отказ');assert.equal(result.error,undefined);
+ assert.equal(asked,0);assert.equal(result.text,'Начало\n\nотказ');assert.equal(result.error,undefined);
 });

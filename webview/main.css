@@ -123,6 +123,8 @@ mark.current-match{background:var(--find-current);outline:1px solid var(--focus)
 .work-head h2{margin:0;padding:0;border:0;flex:1;min-width:0;font-size:13px;font-weight:600}
 #auto-reply-work{box-sizing:border-box;border:1px solid var(--line);min-width:min(100%,56px);width:72px;max-width:72px;height:26px;padding:0;font-size:11px;flex:0 0 auto}
 #auto-reply-work.selected,#auto-reply.selected,#auto-edits.selected,#auto-commands.selected{background:var(--focus);border-color:var(--focus);color:#fff}
+#auto-privileges.selected{background:#c44536;border-color:#c44536;color:#fff}
+body.vscode-light #auto-privileges.selected{background:#b3382c;border-color:#b3382c;color:#fff}
 .floor{display:flex;align-items:center;gap:7px;font-size:13px;min-height:20px}
 .floor strong{font-weight:500}
 .floor-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0}
@@ -182,6 +184,12 @@ mark.current-match{background:var(--find-current);outline:1px solid var(--focus)
 .meter.over{border-color:var(--danger)}
 .meter.over .meter-fill{background:var(--danger)}
 .meter-text{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;line-height:1;white-space:nowrap}
+.feed-meter{position:relative;width:3.5cm;flex:0 0 3.5cm;height:16px;margin-right:5mm;border:1px solid var(--line);border-radius:3px;background:var(--input);overflow:hidden}
+.feed-meter-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--focus);opacity:.55}
+.feed-meter.high .feed-meter-fill{background:var(--warn);opacity:.7}
+.feed-meter.hot{border-color:var(--danger)}
+.feed-meter.hot .feed-meter-fill{background:var(--danger);opacity:.8}
+.feed-meter-text{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;line-height:1;white-space:nowrap;font-variant-numeric:tabular-nums}
 .agent-actions button,.agent-side button,.agent .usage-one{border-color:var(--line);box-sizing:border-box;flex:0 0 42px;width:42px;min-width:42px;max-width:42px;height:26px;padding:0;font-size:10px;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;position:relative;overflow:hidden}
 .agent .stop-one{color:var(--danger)}
 .usage-fill{position:absolute;left:0;top:0;bottom:0;background:var(--focus);opacity:.3;pointer-events:none}
@@ -234,7 +242,30 @@ textarea::placeholder{color:var(--muted)}
 .delta-hint{margin:4px 0 0;font-size:11px;color:var(--muted);line-height:1.4}
 .delta-hint.warn{color:var(--warn)}
 .spacer{flex:1}
-#auto-reply,#auto-edits,#auto-commands{border:1px solid var(--line);font-size:12px}
+#auto-reply,#auto-edits,#auto-commands,#auto-privileges{border:1px solid var(--line);font-size:12px}
+#privilege-dialog{width:min(62rem,calc(100% - 24px));max-width:none;padding:16px 18px}
+#privilege-dialog[open]{display:flex;flex-direction:column;max-height:calc(100% - 24px);overflow:hidden}
+#privilege-dialog h2{margin:0 0 12px;font-size:16px;font-weight:600;flex:0 0 auto}
+/* Top row stays with its text, so the short first block can shrink. The bottom row takes the rest and scrolls inside. */
+#privilege-dialog .privilege-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,max-content) minmax(9rem,1fr);gap:14px;flex:1 1 auto;min-height:0}
+#privilege-dialog .privilege-block{display:flex;flex-direction:column;min-width:0;min-height:0;padding:12px 14px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
+#privilege-dialog .privilege-fit{align-self:start;height:auto}
+#privilege-dialog h3{margin:0 0 10px;font-size:14px;font-weight:600;flex:0 0 auto}
+#privilege-dialog .queue-steps{margin:0;padding:0 0 0 1.4em;font-size:14px;line-height:1.5}
+#privilege-dialog .queue-steps li+li{margin-top:6px}
+#privilege-dialog .privilege-note{margin:0 0 8px;font-size:14px;line-height:1.5;color:var(--muted)}
+#privilege-dialog .privilege-reading{margin:0;font-size:14px;line-height:1.5;color:var(--fg)}
+#privilege-dialog .privilege-block:nth-child(n+3) .privilege-body{flex:1 1 auto;min-height:0;overflow:auto}
+#privilege-dialog .queue-template{padding:10px 12px;background:var(--input);border-radius:var(--radius);font-size:14px;line-height:1.5}
+#privilege-dialog .queue-template p{margin:0;font-size:inherit;line-height:inherit;color:var(--fg)}
+#privilege-dialog .queue-template p+p{margin-top:8px}
+#privilege-dialog .privilege-box{display:flex;gap:10px;align-items:flex-start;margin:0 0 10px;font-size:14px;line-height:1.45}
+#privilege-dialog .privilege-box input{width:auto;height:16px;margin:2px 0 0;flex:0 0 auto;padding:0;accent-color:var(--focus)}
+#privilege-dialog .privilege-box span{flex:1;min-width:0}
+#privilege-dialog .privilege-actions{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;margin-top:auto;padding-top:12px;flex:0 0 auto}
+#privilege-dialog .privilege-actions.choices{grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr)}
+#privilege-dialog .privilege-actions button{width:100%;min-height:34px;border:1px solid var(--line);text-align:center;font-size:14px}
+@media(max-width:640px){#privilege-dialog .privilege-grid{grid-template-columns:minmax(0,1fr);grid-template-rows:none}#privilege-dialog[open]{overflow:auto}}
 #question-body p{margin:0 0 8px;font-size:13px;line-height:1.45}
 #question-body .question-choice{display:block;width:100%;text-align:left;margin:0 0 8px;white-space:normal;border:1px solid var(--line);padding:8px 10px}
 #question-body .question-choice.selected{border-color:var(--focus)}
@@ -297,6 +328,19 @@ dialog input,dialog select,dialog textarea{width:100%}
 #instruction-text{min-height:8em;resize:vertical}
 #instruction-count{margin:6px 0 0}
 dialog p{font-size:12px;color:var(--muted);line-height:1.5;margin:10px 0 14px}
+#fresh-dialog{width:min(20rem,calc(100% - 24px));max-height:none;overflow:visible;padding:12px 14px}
+#fresh-dialog h2{margin:0 0 8px;font-size:15px;font-weight:600}
+#fresh-dialog .fresh-warn{margin:0 0 10px;padding:0 0 0 1.2em;font-size:12px;line-height:1.45;color:var(--muted)}
+#fresh-dialog .fresh-warn li+li{margin-top:4px}
+#fresh-agents{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+#fresh-agents button{width:100%;min-width:0;border:1px solid var(--line);text-align:center}
+#fresh-agents button.selected{border-color:var(--focus);color:var(--focus)}
+#fresh-agents .fresh-note{font-size:12px;line-height:1.45;color:var(--muted)}
+#fresh-dialog .fresh-column{display:flex;flex-direction:column;align-items:stretch;gap:6px;margin-top:10px}
+#fresh-dialog .fresh-count{margin:0;color:var(--fg)}
+#fresh-remember{display:block;width:100%;margin:0;padding:5px 9px;border:1px solid var(--line);background:transparent;color:inherit;text-decoration:none;text-align:center;font-size:inherit;white-space:normal}
+#fresh-dialog .fresh-column .dialog-actions{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px;margin:0}
+#fresh-dialog .dialog-actions button{width:100%;min-width:0;text-align:center}
 dialog>button{border:1px solid var(--line)}
 #creator-dialog{width:min(600px,calc(100% - 32px));height:fit-content;max-width:none;max-height:calc(100% - 48px);padding:0;overflow:hidden;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;box-shadow:0 16px 40px #000a}
 #creator-dialog[open]{display:flex;flex-direction:column}

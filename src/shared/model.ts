@@ -114,6 +114,8 @@ export interface Turn {
   trace?: TraceStep[];
   cycle?: number;
   instruction?: string;
+  // A feed handoff: one discuss turn whose finished text replaces the conversation.
+  summary?: boolean;
 }
 // Retained for snapshots and tasks from the first scaffold.
 export interface Task {id: string; description: string; expected: string; executor?: Provider; source: string; status: Status; snapshot?: string; result?: string}
@@ -125,11 +127,32 @@ export interface State {
   usage: Partial<Record<Provider, Usage>>;
   imports: string[]; diagnostics: string[];
   autoReply?: boolean; autoEdits?: boolean; autoCommands?: boolean; autoActions?: boolean;
+  privilegeOn?: boolean; privileges?: Privilege[];
 }
+// In the project root for the summary turn only; .gitignore lists it.
+export const summaryFile = '.trio-summary.md';
+export const summaryComfort = 'Можно комфортно продолжать работу дальше';
+export const summaryPrompt = [
+  'Trio по кнопке «Новый»: сводка для нового разговора.',
+  '',
+  'Подготовь сводку для продолжения работы. После неё Trio очистит ленту, сбросит сессии всех участников и вставит этот текст первым сообщением. Он станет единственной памятью о прошлом.',
+  '',
+  'Пиши так, чтобы работа продолжилась без разрыва. Порядок:',
+  '1) где остановились: последнее поручение, что сделано, что осталось, какие решения ждут Антона;',
+  '2) незакрытые вопросы и обещания;',
+  '3) действующие правила и решения, которые не пересматриваем;',
+  '4) состояние кода и публикации: версия, незакоммиченное, ветки;',
+  '5) коротко крупные этапы.',
+  '',
+  'Код сверяй с файлами проекта, состояние git — по разделу «Git» в файле ленты. Согласованное отделяй от предложения. Неизвестное не выдавай за проверенное. Номера старой ленты пиши одним словом: #арх464, #архК183, #архЖ78, #архГ245.',
+  '',
+  'Выдай только текст сводки. Архив, очистку и вставку сделает Trio.'
+].join('\n');
 export const fresh = (): State => ({
   conversationId: id(), responseOrder: [], version: 3, messages: [], turns: [], tasks: [], queue: [], draftAttachments: [], draft: '', recipient: 'all',
   agents: providers.map(p => ({id: p, enabled: p !== 'grok', mode: 'discuss', model: '', effort: ''})),
-  sessions: {}, usage: {}, imports: [], diagnostics: [], autoReply: false, autoEdits: false, autoCommands: false
+  sessions: {}, usage: {}, imports: [], diagnostics: [], autoReply: false, autoEdits: false, autoCommands: false,
+  privilegeOn: false, privileges: []
 });
 export const imageExtensions: Record<string, string> = {
   'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp', 'image/bmp': '.bmp'
@@ -157,7 +180,10 @@ const serviceTools = new Set([
   'todowrite', 'todoread', 'todo', 'skill', 'exitplanmode', 'enterplanmode',
   'askuserquestion', 'toolsearch', 'listagents'
 ]);
-const dangerBins = new Set(['rm', 'rd', 'del', 'rmdir', 'removeitem', 'curl', 'wget', 'invokewebrequest']);
+export const privilegeIds = ['delete', 'network', 'git', 'shell', 'unparsed', 'other'] as const;
+export type Privilege = typeof privilegeIds[number];
+const networkBins = new Set(['curl', 'wget', 'invokewebrequest']);
+const shellBins = new Set(['rm', 'rd', 'del', 'rmdir', 'removeitem']);
 const dangerGit = new Set(['commit', 'push', 'reset', 'rebase', 'amend']);
 function stripHeredoc(text: string): string {
   return text.replace(/<<[-]?['"]?(\w+)['"]?[\s\S]*?(?:\r?\n\1\b|$)/g, ' ');
@@ -180,6 +206,8 @@ function stripQuoted(text: string, shell: string): {text: string; ok: boolean} {
         i++; closed = true; break;
       }
       if (!closed) return {text: out, ok: false};
+      // Keep an argument slot so git -C "a b" push still exposes push.
+      out += '\0';
       continue;
     }
     out += c; i++;
@@ -198,15 +226,29 @@ function commandParts(raw: string, shell = ''): string[] | undefined {
   const unquoted = stripQuoted(stripHeredoc(source), shell);
   if (!unquoted.ok) return;
   const cleaned = unquoted.text.replace(/\s-m\s+\S+/gi, ' ').replace(/\s-F\s+\S+/gi, ' ');
-  return cleaned.split(/\s*(?:&&|\|\||;|\||\r?\n)\s*/).map(p => p.trim()).filter(Boolean);
+  return cleaned.split(/\s*(?:&&|\|\||;|\||&|\r?\n)\s*/).map(p => p.trim()).filter(Boolean);
 }
 function commandHead(part: string): {bin: string; arg: string} | undefined {
   const tokens = part.replace(/^\s*(?:[A-Za-z_][\w]*=\S+\s+)*/, '').split(/\s+/).filter(Boolean);
   let i = 0;
   let bin = (tokens[0] || '').replace(/^.*[/\\]/, '').replace(/\.exe$/i, '').toLowerCase();
   if (bin === 'sudo' || bin === 'command') {i = 1; bin = (tokens[1] || '').replace(/^.*[/\\]/, '').replace(/\.exe$/i, '').toLowerCase();}
-  if (!bin) return;
+  if (!bin || bin.includes('\0')) return;
   let j = i + 1;
+  if (bin === 'git') {
+    while (j < tokens.length && tokens[j].startsWith('-')) {
+      const flag = tokens[j++];
+      if (/^(?:-C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env)$/.test(flag)) {
+        if (j >= tokens.length) return;
+        j++;
+      } else if (/^(?:-[Cc].+|--(?:git-dir|work-tree|namespace|super-prefix|config-env)=.*)$/.test(flag)) {
+        continue;
+      } else if (!/^(?:-p|-P|--paginate|--no-pager|--bare|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-lazy-fetch|--no-advice)$/.test(flag)) {
+        return;
+      }
+    }
+    if (tokens[j]?.includes('\0')) return;
+  }
   if (bin === 'ssh') {
     while (j < tokens.length && tokens[j].startsWith('-')) {
       const flag = tokens[j++];
@@ -215,18 +257,28 @@ function commandHead(part: string): {bin: string; arg: string} | undefined {
   }
   return {bin, arg: tokens[j] || ''};
 }
-function classifyCommand(raw: string, shell = ''): 'command' | 'danger' {
+function commandPrivileges(raw: string, shell = ''): {needs: Set<Privilege>; safeCommand: boolean} | 'unparsed' {
   const parts = commandParts(raw, shell);
-  if (!parts) return 'danger';
-  if (!parts.length) return 'command';
+  if (!parts) return 'unparsed';
+  const needs = new Set<Privilege>();
+  let safeCommand = false;
+  if (!parts.length) return 'unparsed';
   for (const part of parts) {
     const head = commandHead(part);
-    if (!head) return 'danger';
+    if (!head) {needs.add('unparsed'); continue;}
     const key = head.bin.replace(/[^a-z0-9]+/g, '');
-    if (dangerBins.has(key)) return 'danger';
-    if (head.bin === 'git' && dangerGit.has(head.arg.toLowerCase())) return 'danger';
+    if (['powershell', 'pwsh', 'bash', 'sh', 'zsh', 'cmd'].includes(head.bin)) needs.add('unparsed');
+    else if (networkBins.has(key)) needs.add('network');
+    else if (shellBins.has(key)) needs.add('shell');
+    else if (head.bin === 'git' && dangerGit.has(head.arg.toLowerCase())) needs.add('git');
+    else safeCommand = true;
   }
-  return 'command';
+  return {needs, safeCommand};
+}
+function classifyCommand(raw: string, shell = ''): 'command' | 'danger' {
+  const found = commandPrivileges(raw, shell);
+  if (found === 'unparsed') return 'danger';
+  return found.needs.size ? 'danger' : 'command';
 }
 export function permissionClass(title: string, detail = ''): 'read' | 'edit' | 'command' | 'danger' {
   let obj: any, kind = '', command = '';
@@ -239,6 +291,8 @@ export function permissionClass(title: string, detail = ''): 'read' | 'edit' | '
   const name = toolName(title, obj);
   if (kind === 'danger' || kind === 'delete' || kind === 'fetch' || kind === 'web_fetch' || kind === 'web_search') return 'danger';
   if (/\b(webfetch|websearch|web_fetch|web_search)\b/i.test(title)) return 'danger';
+  const op = String(obj?.type || obj?.operation || obj?.change || obj?.fileChange?.type || '').toLowerCase();
+  if (op === 'delete' || op === 'remove') return 'danger';
   if (serviceTools.has(name)) return 'read';
   if (kind === 'read' || kind === 'search' || kind === 'think') return 'read';
   if (kind === 'edit' || kind === 'move' || kind === 'write') return 'edit';
@@ -253,6 +307,36 @@ export function permissionClass(title: string, detail = ''): 'read' | 'edit' | '
     return 'edit';
   }
   return 'danger';
+}
+export function dangerCover(title: string, detail = ''): {needs: Privilege[]; safeCommand: boolean; safeEdit?: boolean} | undefined {
+  if (permissionClass(title, detail) !== 'danger') return;
+  let obj: any, kind = '', command = '';
+  try {obj = JSON.parse(detail);} catch {obj = undefined;}
+  if (obj && typeof obj === 'object') {
+    kind = String(obj.kind || obj.toolCall?.kind || obj._meta?.kind || metaTool(obj).kind || '').toLowerCase();
+    command = String(obj.rawInput?.command || obj.command || obj.title || '');
+  }
+  const extra = detail.trim().startsWith('{') ? '' : detail;
+  const needs = new Set<Privilege>();
+  let safeCommand = false;
+  if (kind === 'delete') needs.add('delete');
+  if (kind === 'fetch' || kind === 'web_fetch' || kind === 'web_search' || /\b(webfetch|websearch|web_fetch|web_search)\b/i.test(title)) needs.add('network');
+  const op = String(obj?.type || obj?.operation || obj?.change || obj?.fileChange?.type || '').toLowerCase();
+  if (op === 'delete' || op === 'remove') needs.add('delete');
+  const shellTitle = /\b(bash|shell|powershell|cmd\.exe)\b/i.test(title) || /выполнение команды/i.test(title);
+  const commandText = command || extra;
+  if (kind === 'execute' || shellTitle || kind === 'danger' && commandText.trim()) {
+    // Codex marks a shell wrapper it could not open as danger: its text is not the real command.
+    const found = kind === 'danger' || !commandText.trim() ? 'unparsed' : commandPrivileges(commandText, String(obj?.shell || ''));
+    if (found === 'unparsed') needs.add('unparsed');
+    else {
+      for (const item of found.needs) needs.add(item);
+      if (found.needs.size && found.safeCommand) safeCommand = true;
+    }
+  }
+  if (!needs.size) needs.add('other');
+  const safeEdit = Array.isArray(obj?.changes) && obj.changes.some((change: any) => ['add', 'update'].includes(change?.kind?.type ?? change?.kind));
+  return {needs: privilegeIds.filter(id => needs.has(id)), safeCommand, ...(safeEdit ? {safeEdit: true} : {})};
 }
 export function permissionSignature(title: string, detail = ''): string | undefined {
   let obj: any, kind = '', command = '';
@@ -375,6 +459,23 @@ function speaker(m: Message, messages: Message[], turns: {messageId: string; rep
     + (m.cancelled ? ' [снят]' : '')
     + (m.error ? ' [ошибка]' : '');
 }
+// The summarizer's source: plain text with the old feed numbers. The raw state is
+// several times larger (permission cards, traces, diagnostics) and no engine could read it.
+export function summaryFeed(state: State, git: string): string {
+  const {messages, turns} = state;
+  const posts = messages.map(m => '### ' + speaker(m, messages, turns)
+    + (m.control ? ' [служебное]' : '')
+    + (typeof m.at === 'number' ? ' · ' + new Date(m.at).toISOString().slice(0, 10) : '')
+    + '\n' + messageText(m) + '\n');
+  const queue = state.queue.map(x => turns.find(t => t.id === x)).filter((t): t is Turn => !!t)
+    .map((t, i) => (i + 1) + '. ' + (messageMark(messages, turns, t.messageId) || 'сообщение без номера')
+      + ' → ' + (t.recipient === 'all' ? 'всем' : names[t.recipient]));
+  return ['# Лента Trio для сводки', '',
+    'Номера — старой ленты. В сводке пиши их одним словом: #арх464, #архК183.', '',
+    '## Git', '', git.trim() || 'не получено', '',
+    '## Очередь (' + queue.length + ')', '', queue.length ? queue.join('\n') : 'пусто', '',
+    '## Сообщения (' + messages.length + ')', '', ...posts].join('\n').replace(/\r\n?/g, '\n');
+}
 export function contextFit(messages: Message[], current: string, limit: number,
     catalog?: {messages: Message[]; turns: {messageId: string; replyId?: string}[]}): {text: string; omitted: number; shown: number} {
   if (current.length > limit) throw new Error('Поручение превышает trio.contextChars. Увеличьте лимит или сократите сообщение.');
@@ -404,6 +505,8 @@ export type Input =
   | {type: 'send'; text: string; recipient: Recipient; responseOrder?: Provider[]; conversationId?: string; attachments?: Attachment[]; discuss?: boolean}
   | {type: 'layout'; side: 'left' | 'right'; width: number}
   | {type: 'reset'; mode: 'context' | 'conversation'; conversationId?: string; provider?: Provider}
+  | {type: 'fresh-summary'; provider: Provider; conversationId?: string}
+  | {type: 'feed-max'; count: number; conversationId?: string}
   | {type: 'handoff'; provider: Provider; turnId?: string}
   | {type: 'retry'; turnId: string}
   | {type: 'stop'; provider?: Provider}
@@ -414,15 +517,17 @@ export type Input =
   | {type: 'agent'; agent: Agent}
   | {type: 'changes'; taskId: string}
   | {type: 'discard'; turnId: string}
-  | {type: 'flags'; autoReply?: boolean; autoEdits?: boolean; autoCommands?: boolean; autoActions?: boolean}
+  | {type: 'flags'; autoReply?: boolean; autoEdits?: boolean; autoCommands?: boolean; autoActions?: boolean; privilegeOn?: boolean; privileges?: Privilege[]}
   | {type: 'answer'; requestId: string; answers: QuestionAnswers}
   | {type: 'permission'; requestId: string; allow: boolean; whole?: boolean; standing?: boolean}
-  | {type: 'snippets'; items: Snippet[]};
+  | {type: 'snippets'; items: Snippet[]}
+  | {type: 'copy'; text: string};
 export function input(value: unknown): Input | undefined {
   if (!value || typeof value !== 'object') return;
   const v = value as Record<string, any>;
   if (['ready', 'export', 'import', 'settings', 'plugin-settings', 'diagnostics', 'popout', 'attach', 'archives', 'project', 'reconnect', 'pong'].includes(v.type)) return v as Input;
   if ((v.type === 'open-image' || v.type === 'save-image') && typeof v.id === 'string' && v.id.length <= 100) return v as Input;
+  if (v.type === 'copy' && typeof v.text === 'string' && v.text.length <= 20000) return {type: 'copy', text: v.text};
   if (v.attachments !== undefined && !validAttachments(v.attachments)) return;
   if (v.conversationId !== undefined && typeof v.conversationId !== 'string') return;
   if (v.responseOrder !== undefined && (!Array.isArray(v.responseOrder) || v.responseOrder.length > 3 || v.responseOrder.some((p: unknown) => !isProvider(p)) || new Set(v.responseOrder).size !== v.responseOrder.length)) return;
@@ -430,6 +535,8 @@ export function input(value: unknown): Input | undefined {
   if (v.type === 'layout' && ['left', 'right'].includes(v.side) && typeof v.width === 'number' && Number.isFinite(v.width) && v.width >= 260 && v.width <= 600) return v as Input;
   if (v.type === 'reset' && ['context', 'conversation'].includes(v.mode)
     && (v.provider === undefined || isProvider(v.provider))) return v as Input;
+  if (v.type === 'fresh-summary' && isProvider(v.provider)) return v as Input;
+  if (v.type === 'feed-max' && Number.isInteger(v.count) && v.count >= 1 && v.count <= 1000000) return v as Input;
   if (['draft', 'send'].includes(v.type) && typeof v.text === 'string' && v.text.length <= 1000000 && (v.recipient === 'all' || isProvider(v.recipient))) return v as Input;
   if (v.type === 'stop' && (v.provider === undefined || isProvider(v.provider))) return v as Input;
   if (v.type === 'catalog' && isProvider(v.provider)) return v as Input;
@@ -447,7 +554,9 @@ export function input(value: unknown): Input | undefined {
   if (v.type === 'flags' && (v.autoReply === undefined || typeof v.autoReply === 'boolean')
     && (v.autoEdits === undefined || typeof v.autoEdits === 'boolean')
     && (v.autoCommands === undefined || typeof v.autoCommands === 'boolean')
-    && (v.autoActions === undefined || typeof v.autoActions === 'boolean')) return v as Input;
+    && (v.autoActions === undefined || typeof v.autoActions === 'boolean')
+    && (v.privilegeOn === undefined || typeof v.privilegeOn === 'boolean')
+    && (v.privileges === undefined || Array.isArray(v.privileges) && v.privileges.every((p: unknown) => privilegeIds.includes(p as Privilege)) && new Set(v.privileges).size === v.privileges.length)) return v as Input;
   if (v.type === 'answer' && typeof v.requestId === 'string' && v.answers && typeof v.answers === 'object'
     && !Array.isArray(v.answers) && Object.keys(v.answers).length <= 8
     && Object.values(v.answers).every(x => typeof x === 'string' ? x.length <= 2000

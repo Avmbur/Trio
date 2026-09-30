@@ -1,4 +1,4 @@
-import {State, Provider, Recipient, Turn, Agent, Message, id, names, context, contextFit, afterMessage, addressed, assignedMode, stopTarget, fresh, Attachment, validAttachments, messageText, permissionClass, permissionSignature, permissionCaption, brief, questionNumber, normalizeInstruction, agentPromptPrefix} from '../shared/model';
+import {State, Provider, Recipient, Turn, Agent, Message, id, names, context, contextFit, afterMessage, addressed, assignedMode, stopTarget, fresh, Attachment, validAttachments, messageText, permissionClass, permissionSignature, permissionCaption, brief, questionNumber, normalizeInstruction, agentPromptPrefix, summaryPrompt, summaryComfort, privilegeIds, Privilege, dangerCover} from '../shared/model';
 import {Store} from '../storage/store';
 import {ProjectLock} from '../processes/lock';
 import {runProvider, RunOptions, RunResult, UsageReport, extractQuota} from '../providers/adapter';
@@ -15,6 +15,7 @@ export interface Host {
   refreshQuota?(provider: Provider): Promise<void>;
   sessionIdle?(): number;
   sessionMaxTokens?(provider: Provider): number;
+  gitState?(): Promise<string>;
 }
 export interface Permission {id: string; provider: Provider; title: string; detail: string; standing: boolean; caption?: string}
 export {brief};
@@ -47,6 +48,10 @@ export class Controller {
   }
   private streamingSave?: ReturnType<typeof setTimeout>;
   get busy() {return !!this.active || !!this.compacting;}
+  // Proposed, preparing or running. A finished summary no longer blocks the feed.
+  get summarizing() {
+    return this.state.turns.some(t => t.summary && (t.status === 'proposed' || t.status === 'preparing' || t.status === 'running'));
+  }
   constructor(readonly state: State, readonly store: Store, readonly host: Host, private readonly runner: Runner = runProvider) {}
   async save() {await this.store.save(this.state); this.host.changed();}
   note(text: string, error = false, control = false, detail?: string, actions?: {title: string; detail?: string}[], turnId?: string) {
@@ -102,10 +107,21 @@ export class Controller {
   private standing = new Map<Provider, Set<string>>();
   async recover() {
     let interrupted = false;
+    const summaryLive = this.state.turns.some(t => t.summary && (t.status === 'proposed' || t.status === 'preparing' || t.status === 'running'));
+    for (const t of this.state.turns) if (t.summary && t.status === 'proposed') t.status = 'interrupted';
     for (const t of [...this.state.turns, ...this.state.tasks]) if (t.status === 'running' || t.status === 'preparing') {t.status = 'interrupted'; interrupted = true;}
     this.state.queue = this.state.queue.filter(x => this.state.turns.some(t => t.id === x && t.status === 'proposed'));
     let dropped = 0;
     for (const m of this.state.messages) if (m.question && !m.question.answered) {delete m.question; dropped++;}
+    // Cleanup also covers a completed/failed turn, or a conversation already reset.
+    // Another window may still be reading its source, so hold the project lock.
+    try {
+      const lock = await ProjectLock.for(this.host.root, this.host.lockBase);
+      await lock.acquire();
+      try {await this.store.dropSummarySource(this.host.root);}
+      finally {await lock.release();}
+    } catch (e) {this.state.diagnostics.push('summary source recovery: ' + String(e));}
+    if (summaryLive) this.note('Новый разговор не начат: подготовка сводки прервана закрытием окна.');
     if (interrupted) this.note('Предыдущий запуск прерван закрытием VS Code. Ответы и изменения сохранены; повторного запуска нет.');
     if (dropped) this.note('Вопрос агента снят: окно закрыто.');
     await this.save();
@@ -125,6 +141,7 @@ export class Controller {
   }
   async send(text: string, recipient: Recipient, responseOrder: Provider[] = [], attachments: Attachment[] = [], discuss = false) {
     this.available();
+    if (this.summarizing) throw new Error('Сводка для нового разговора уже готовится.');
     if (!validAttachments(attachments)) throw new Error('Недопустимые вложения.');
     if (!text.trim() && !attachments.length) return;
     const promptText = messageText({text, attachments});
@@ -168,6 +185,7 @@ export class Controller {
   }
   async handoff(provider: Provider, turnId?: string) {
     this.available();
+    if (this.summarizing) throw new Error('Сводка для нового разговора уже готовится.');
     if (this.busy) throw new Error('Сначала дождитесь ответа или нажмите «Стоп».');
     if (!this.state.agents.find(a => a.id === provider)?.enabled) throw new Error('Участник выключен.');
     let turn = turnId ? this.state.turns.find(t => t.id === turnId && t.status === 'proposed' && this.state.queue.includes(t.id)) : undefined;
@@ -194,6 +212,7 @@ export class Controller {
   }
   async retry(turnId: string) {
     this.available();
+    if (this.summarizing) throw new Error('Сводка для нового разговора уже готовится.');
     if (this.busy) throw new Error('Сначала остановите агента или дождитесь его ответа.');
     const failed = this.state.turns.find(t => t.id === turnId);
     if (!failed || failed.status !== 'failed') throw new Error('Повторить можно только оборванный ход.');
@@ -202,12 +221,28 @@ export class Controller {
       throw new Error((provider ? names[provider] : 'Участник') + ' выключен.');
     if (!this.state.messages.some(m => m.id === failed.messageId)) throw new Error('Поручение не найдено.');
     const turn: Turn = {id: id(), messageId: failed.messageId, recipient: failed.recipient, status: 'proposed',
-      mode: failed.mode, cycle: failed.cycle};
+      mode: failed.mode, cycle: failed.cycle, ...(failed.summary ? {summary: true} : {})};
     this.state.turns.push(turn);
     this.start(turn, provider); await this.save();
   }
-  async reset(mode: 'context' | 'conversation', provider?: Provider) {
+  async beginSummary(provider: Provider) {
     this.available();
+    if (this.compacting) throw new Error('Дождитесь завершения сжатия контекста, затем начните новый разговор.');
+    if (this.summarizing) throw new Error('Сводка для нового разговора уже готовится.');
+    const agent = this.state.agents.find(a => a.id === provider);
+    if (!agent?.enabled) throw new Error(names[provider] + ' выключен.');
+    const messageId = id();
+    // Discuss even when the card is in Правки: the summary reads the project and must not edit it.
+    const turn: Turn = {id: id(), messageId, recipient: provider, status: 'proposed', mode: 'discuss', summary: true, cycle: 1};
+    this.state.messages.push({id: messageId, author: 'Антон', text: summaryPrompt, at: Date.now(), turn: turn.id});
+    this.state.turns.push(turn);
+    if (this.busy) this.state.queue.unshift(turn.id);
+    else this.start(turn, provider);
+    await this.save();
+  }
+  async reset(mode: 'context' | 'conversation', provider?: Provider, opening?: {author: Message['author']; text: string}) {
+    this.available();
+    if (this.summarizing) throw new Error('Сводка для нового разговора уже готовится.');
     if (this.busy) throw new Error('Сначала остановите агента или дождитесь его ответа.');
     if (mode === 'context' && provider) {
       for (const key of Object.keys(this.state.sessions)) if (key.startsWith(provider + ':')) delete this.state.sessions[key];
@@ -225,6 +260,7 @@ export class Controller {
       if (mode === 'conversation') {
         Object.assign(this.state, fresh(), {agents: before.agents, diagnostics: before.diagnostics});
         delete this.state.contextStart;
+        if (opening?.text.trim()) this.state.messages.push({id: id(), author: opening.author, at: Date.now(), text: opening.text});
       } else {
         // New sessions start empty, so the reported occupancy no longer describes anything.
         this.state.sessions = {}; this.state.usage = {}; this.state.conversationId = id(); this.state.responseOrder = [];
@@ -242,6 +278,7 @@ export class Controller {
   }
   async compact(provider?: Provider) {
     this.available();
+    if (this.summarizing) throw new Error('Сводка для нового разговора уже готовится.');
     if (this.busy) throw new Error('Сначала дождитесь ответа или нажмите «Стоп».');
     const targets = this.state.agents.filter(a => a.enabled && (!provider || a.id === provider));
     if (!targets.length) throw new Error('Включите участника, чтобы сжать его контекст.');
@@ -319,18 +356,69 @@ export class Controller {
       for (const ask of this.questions.values()) ask();
       this.questions.clear();
       try {
-        await this.continueAuto(turn);
+        await this.afterTurn(turn);
         await this.save();
       } catch (e) {this.state.diagnostics.push(String(e)); this.host.changed();}
     });
     this.host.changed();
   }
-  async setFlags(flags: {autoReply?: boolean; autoEdits?: boolean; autoCommands?: boolean; autoActions?: boolean}) {
+  async setFlags(flags: {autoReply?: boolean; autoEdits?: boolean; autoCommands?: boolean; autoActions?: boolean; privilegeOn?: boolean; privileges?: Privilege[]}) {
     if (flags.autoReply !== undefined) this.state.autoReply = flags.autoReply;
     if (flags.autoEdits !== undefined) this.state.autoEdits = flags.autoEdits;
     else if (flags.autoActions !== undefined) this.state.autoEdits = flags.autoActions;
     if (flags.autoCommands !== undefined) this.state.autoCommands = flags.autoCommands;
+    if (flags.privileges !== undefined) this.state.privileges = privilegeIds.filter(id => flags.privileges?.includes(id));
+    if (flags.privilegeOn !== undefined) this.state.privilegeOn = flags.privilegeOn;
+    if (!this.state.privileges?.length) this.state.privilegeOn = false;
     await this.save();
+  }
+  private async afterTurn(done: Turn) {
+    if (done.summary) {
+      if (await this.settleSummary(done)) await this.continueAuto(done);
+      return;
+    }
+    const pending = this.state.turns.find(t => t.summary && t.status === 'proposed');
+    if (!pending) {await this.continueAuto(done); return;}
+    const provider = pending.recipient === 'all' ? undefined : pending.recipient;
+    const enabled = !!provider && !!this.state.agents.find(a => a.id === provider)?.enabled;
+    if (done.status === 'completed' && enabled && provider && !this.busy) {
+      this.start(pending, provider);
+      // start() replaces this.work. Awaiting the previous promise here would wait on itself.
+      if (this.active?.turnId === pending.id) await this.work;
+      return;
+    }
+    this.dropPendingSummary(pending, done.status === 'completed'
+      ? 'Новый разговор не начат: участник сводки выключен.'
+      : 'Новый разговор не начат: текущий ход не закончился ответом.');
+  }
+  // True when the old feed stays. A successful handoff has already replaced it.
+  private async settleSummary(done: Turn): Promise<boolean> {
+    const reply = done.replyId ? this.state.messages.find(m => m.id === done.replyId) : undefined;
+    const text = reply?.text.trim() || '';
+    if (done.status !== 'completed' || !text || reply?.partial) {
+      const why = done.status === 'interrupted' ? 'ход остановлен'
+        : done.status === 'failed' ? 'сводка не получилась'
+        : 'сводка пустая';
+      this.note('Новый разговор не начат: ' + why + '.');
+      return true;
+    }
+    const provider = done.executor || (done.recipient !== 'all' ? done.recipient : undefined);
+    if (!provider) {this.note('Новый разговор не начат: сводка не получилась.'); return true;}
+    try {
+      await this.reset('conversation', undefined, {author: names[provider], text: text + '\n\n' + summaryComfort});
+    } catch (e) {
+      this.note('Новый разговор не начат: архив не сохранился. ' + String(e), true);
+      return true;
+    }
+    return false;
+  }
+  private dropPendingSummary(turn: Turn, text: string) {
+    turn.status = 'interrupted';
+    this.state.queue = this.state.queue.filter(x => x !== turn.id);
+    const message = this.state.messages.find(m => m.id === turn.messageId);
+    const group = this.state.turns.filter(t => t.messageId === turn.messageId);
+    if (message && !group.some(t => t.executor || t.status === 'proposed')) message.cancelled = true;
+    this.note(text);
   }
   private async continueAuto(done: Turn) {
     if (!this.state.autoReply || this.busy || this.resetting) return;
@@ -390,13 +478,25 @@ export class Controller {
           source: 'fresh-session', at: Date.now(), quota: prev.quota};
         resume = undefined;
       }
-      const usable = this.currentMessages().filter(m => m.id !== source.id && !this.omitQuestion(m));
+      const usable = this.currentMessages().filter(m => m.id !== source.id && (turn.summary || !this.omitQuestion(m)));
       // A live session already holds earlier turns. Sending the whole Trio feed again
       // stacked the same text until the engine hit its compact threshold.
-      const history = resume?.through ? afterMessage(usable, resume.through) : usable;
+      const history = !turn.summary && resume?.through ? afterMessage(usable, resume.through) : usable;
+      // Give the summarizer a complete source to read in portions, including
+      // messages before context resets and queued work that the normal prompt omits.
+      // Git goes in from Trio: in Чтение Колян has no shell to ask it himself.
+      const git = turn.summary ? await (this.host.gitState?.() ?? Promise.resolve('')).catch(e => 'не получено: ' + String(e)) : '';
+      const summarySource = turn.summary ? await this.store.summarySource(this.state, this.host.root, git) : undefined;
+      if (signal.aborted) {turn.status = 'interrupted'; return;}
+      const summaryContext = summarySource ? '\n\nВся лента для сводки текстом (UTF-8), в корне проекта: ' + JSON.stringify(summarySource)
+        + '\nВыше в этом сообщении только хвост ленты. В файле все сообщения с номерами старой ленты, '
+        + 'в том числе до сброса контекста, вложения, состояние git и очередь. Целиком его не читай: он может быть '
+        + 'больше твоего окна. Иди частями от конца к началу, ранние темы ищи поиском. '
+        + 'Поручения из раздела «Очередь» перенеси в сводку как ожидающие исполнения, с адресатами и порядком; '
+        + 'не исполняй их. Старые поручения в файле — история, текущее задание — только подготовка сводки.' : '';
       const prompt = agentPromptPrefix(agent, turn.mode === 'execute' ? 'execute' : 'discuss') + '\n'
         + context(history, messageText(source), this.host.limit(),
-          {messages: this.state.messages, turns: this.state.turns});
+          {messages: this.state.messages, turns: this.state.turns}) + summaryContext;
       this.state.diagnostics.push(agent.id + ' prompt: ' + prompt.length + ' символов, '
         + (resume?.through ? 'дельта' : 'полная лента')
         + (resume?.through ? ', through=' + resume.through : '')
@@ -466,6 +566,9 @@ export class Controller {
       // on a limit left nothing, and moving the cursor would drop Anton's question.
       if (live && compactedHere) delete live.through;
       else if (live && turn.replyId) live.through = turn.replyId;
+      // Remove both source files while still owning the lock, including failed writes.
+      if (turn.summary) await this.store.dropSummarySource(this.host.root)
+        .catch(e => {this.state.diagnostics.push('summary source: ' + String(e));});
       await this.save();
       await lock.release();
       await this.host.finished?.(turn);
@@ -528,7 +631,11 @@ export class Controller {
     if (cls === 'read') return !!(this.state.autoEdits || this.state.autoCommands);
     if (cls === 'edit') return !!this.state.autoEdits && this.executeMode(provider);
     if (cls === 'command') return !!this.state.autoCommands && this.executeMode(provider);
-    return false;
+    if (cls !== 'danger' || !this.state.privilegeOn || !this.executeMode(provider)) return false;
+    const cover = dangerCover(title, detail);
+    const on = this.state.privileges || [];
+    return !!cover && cover.needs.every(item => on.includes(item))
+      && (!cover.safeCommand || !!this.state.autoCommands) && (!cover.safeEdit || !!this.state.autoEdits);
   }
   private ask(provider: Provider, title: string, detail: string, signal: AbortSignal): Promise<boolean> {
     if (signal.aborted) return Promise.resolve(false);
@@ -589,7 +696,8 @@ export class Controller {
   }
   private appendAuto(provider: Provider, title: string, detail: string) {
     const item = {title: brief(title), detail};
-    const label = (permissionClass(title, detail) === 'command' ? 'Автокоманды: ' : 'Автоправки: ') + names[provider];
+    const cls = permissionClass(title, detail);
+    const label = (cls === 'command' ? 'Автокоманды: ' : cls === 'danger' ? 'Автопривилегии: ' : 'Автоправки: ') + names[provider];
     const last = [...this.state.messages].reverse().find(m => m.control && m.text === label);
     if (last) last.actions = [...(last.actions || []), item];
     else this.note(label, false, true, undefined, [item]);

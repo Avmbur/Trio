@@ -72,6 +72,36 @@ test('v2 state with inline messages still loads',async t=>{
  assert.equal(s.messages[0].text,'старое');
  assert.equal(s.version,3);
 });
+test('a locked snapshot-refs file does not fail the save',{skip:process.platform!=='win32'},async t=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'trio-store-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ const store=new Store(dir);const s=await store.load();
+ const oldSnap=path.join(dir,'snapshots','old');const newSnap=path.join(dir,'snapshots','new');
+ s.draft='before';s.turns.push({id:'t',messageId:'m',recipient:'claude',status:'completed',snapshot:oldSnap});
+ await store.save(s);
+ const refs=path.join(dir,'snapshot-refs.json');
+ const reader=await fs.open(refs,'r');
+ try {
+  s.draft='after';s.diagnostics=[];s.turns[0].snapshot=newSnap;
+  await store.save(s);
+  assert.equal((await new Store(dir).load()).draft,'after');
+  assert.deepEqual(JSON.parse(await fs.readFile(refs,'utf8')).snapshots,[oldSnap]);
+  assert.ok(s.diagnostics.some(line=>/snapshot-refs:/.test(line)&&/EPERM/.test(line)));
+ } finally {await reader.close();}
+ s.diagnostics=[];await store.save(s);
+ assert.equal(s.diagnostics.length,0);
+ assert.deepEqual(JSON.parse(await fs.readFile(refs,'utf8')).snapshots,[newSnap]);
+});
+test('a locked state.json still fails the save',{skip:process.platform!=='win32'},async t=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'trio-store-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ const store=new Store(dir);const s=await store.load();
+ s.draft='before';await store.save(s);
+ const reader=await fs.open(path.join(dir,'state.json'),'r');
+ try {
+  s.draft='after';
+  await assert.rejects(store.save(s),{code:'EPERM'});
+ } finally {await reader.close();}
+ assert.equal((await new Store(dir).load()).draft,'before');
+});
 test('shortError keeps the file name and drops the long path',()=>{
  const text=shortError("Error: EPERM: operation not permitted, rename 'c:\\\\Users\\\\code\\\\AppData\\\\Roaming\\\\Code\\\\User\\\\globalStorage\\\\trio-local.trio-chat\\\\projects\\\\abc\\\\state.json.tmp' -> 'c:\\\\Users\\\\code\\\\AppData\\\\Roaming\\\\Code\\\\User\\\\globalStorage\\\\trio-local.trio-chat\\\\projects\\\\abc\\\\state.json'");
  assert.match(text,/state\.json/);

@@ -3,6 +3,8 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import {createHash} from 'node:crypto';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import {PanelConnection, renderPanelHtml} from './ui/panelConnection';
 import {Store, shortError} from './storage/store';
 import {Controller} from './orchestrator/controller';
@@ -14,6 +16,7 @@ import {compare, beforeFile, Limits, inside} from './snapshots/snapshots';
 import {SnapshotStorage} from './snapshots/storage';
 import {preserveDirty} from './snapshots/dirtyDocuments';
 
+const exec = promisify(execFile);
 let controller: Controller | undefined;
 let workspaceOwner: ProjectLock | undefined;
 export async function activate(ctx: vscode.ExtensionContext) {
@@ -30,6 +33,10 @@ export async function activate(ctx: vscode.ExtensionContext) {
   output.appendLine('Trio ' + loadedVersion + ' · ' + ctx.extensionPath);
   const reportedCopyFailures = new Set<string>();
   const config = () => vscode.workspace.getConfiguration('trio');
+  const feedMax = () => {
+    const n = config().get<number>('feedMaxMessages', 1000);
+    return Number.isInteger(n) && n >= 1 ? Math.min(1000000, n) : 1000;
+  };
   const snapshots = new SnapshotStorage(ctx.globalStorageUri.fsPath, () => config().get<number>('snapshotStorageMiB', 1024) * 1048576);
   const cleanSnapshots = () => snapshots.prune().catch(e => output.appendLine('Snapshots: ' + String(e)));
   const jobRunner = path.join(ctx.extensionPath, 'dist', 'native', 'JobRunner.exe');
@@ -74,7 +81,8 @@ export async function activate(ctx: vscode.ExtensionContext) {
       compacting: controller.compacting, root: controller.host.root, detached, layout, catalogs,
       deltas: controller.deltaHints(), snippets,
       // The feed folds long messages; the threshold lives in settings, so it rides along with the state.
-      collapseLines: config().get<number>('collapseMessageLines', 100)});
+      collapseLines: config().get<number>('collapseMessageLines', 100),
+      feedMax: feedMax()});
   };
   const publish = () => {
     if (!publishTimer) publishTimer = setTimeout(() => {publishTimer = undefined; publishNow();}, 40);
@@ -126,6 +134,12 @@ export async function activate(ctx: vscode.ExtensionContext) {
         },
         trusted: () => vscode.workspace.isTrusted && !shuttingDown,
         changed: publish,
+        gitState: async () => {
+          const run = async (...args: string[]) => String((await exec('git', ['-c', 'core.quotepath=false', '-C', root, ...args], {timeout: 10000, maxBuffer: 1048576, windowsHide: true})).stdout).trim();
+          const text = '$ git status --short --branch\n' + await run('status', '--short', '--branch')
+            + '\n\n$ git log --oneline -5\n' + await run('log', '--oneline', '-5');
+          return text.length > 20000 ? text.slice(0, 20000) + '\n…' : text;
+        },
         compact: async ({provider, session, signal}) => {
           await compactProvider({provider, session, signal, cli: await cli(provider), root,
             jobRunner, timeout: 1000 * config().get<number>('executionTimeoutSeconds', 1800),
@@ -217,6 +231,7 @@ export async function activate(ctx: vscode.ExtensionContext) {
     if (m.type === 'layout') {layout = {side: m.side, width: m.width}; await ctx.workspaceState.update('trio.layout', layout); publishNow(); return;}
     if (m.type === 'snippets') {snippets = m.items; await ctx.globalState.update('trio.snippets', snippets); publishNow(); return;}
     if (m.type === 'reconnect') {refreshPanel?.(); return;}
+    if (m.type === 'copy') {await vscode.env.clipboard.writeText(m.text); return;}
     await initialize();
     const c = controller!;
     if (c.resetting) throw new Error('Дождитесь завершения очистки разговора.');
@@ -244,6 +259,11 @@ export async function activate(ctx: vscode.ExtensionContext) {
         if (target) await fs.copyFile(file, target.fsPath);
         break;
       }
+      case 'fresh-summary': await c.beginSummary(m.provider); break;
+      case 'feed-max':
+        await vscode.workspace.getConfiguration('trio').update('feedMaxMessages', m.count, vscode.ConfigurationTarget.Global);
+        publishNow();
+        break;
       case 'reset': {
         const archive = await c.reset(m.mode, m.provider);
         if (!m.provider) {await pruneImages(); await cleanSnapshots();}
@@ -252,7 +272,7 @@ export async function activate(ctx: vscode.ExtensionContext) {
       }
       case 'handoff': await c.handoff(m.provider, m.turnId); break;
       case 'retry': await c.retry(m.turnId); break;
-      case 'flags': await c.setFlags({autoReply: m.autoReply, autoEdits: m.autoEdits, autoCommands: m.autoCommands, autoActions: m.autoActions}); break;
+      case 'flags': await c.setFlags({autoReply: m.autoReply, autoEdits: m.autoEdits, autoCommands: m.autoCommands, autoActions: m.autoActions, privilegeOn: m.privilegeOn, privileges: m.privileges}); break;
       case 'answer': c.answer(m.requestId, m.answers); break;
       case 'stop': await c.stop(m.provider); break;
       case 'compact': await c.compact(m.provider); break;
@@ -393,7 +413,7 @@ export async function activate(ctx: vscode.ExtensionContext) {
         await vscode.workspace.fs.writeFile(target, Buffer.from(text, 'utf8')); break;
       }
       case 'import': {
-        if (c.busy) throw new Error('Импортируйте историю после завершения ответа.');
+        if (c.busy || c.summarizing) throw new Error('Импортируйте историю после завершения ответа.');
         const importingConversation = c.state.conversationId;
         const files = await vscode.window.showOpenDialog({canSelectMany: false, filters: {Markdown: ['md']}});
         if (!files?.[0]) return;
@@ -474,7 +494,7 @@ export async function activate(ctx: vscode.ExtensionContext) {
   ctx.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
     if (e.affectsConfiguration('trio.snapshotStorageMiB')) void cleanSnapshots();
     // A new folding threshold has to reach the open panel without a reload.
-    if (e.affectsConfiguration('trio.collapseMessageLines')) publish();
+    if (e.affectsConfiguration('trio.collapseMessageLines') || e.affectsConfiguration('trio.feedMaxMessages')) publish();
   }));
   ctx.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
     shuttingDown = true; void controller?.stop().catch(fail);

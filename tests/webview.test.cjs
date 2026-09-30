@@ -22,6 +22,7 @@ test('real webview has all referenced controls, strict CSP and no demo runtime',
  assert.doesNotMatch(js,/setRangeText\(/);
  assert.match(html,/id="instruction-text"[^>]*maxlength="1000"/);
  assert.doesNotMatch(js,/reload-spacer/);
+ assert.doesNotMatch(js,/как максимум/);
 });
 test('dark palette takes text colour from the editor and the waiting buttons keep blinking',()=>{
  const css=fs.readFileSync('webview/main.css','utf8');
@@ -109,6 +110,44 @@ test('dark palette takes text colour from the editor and the waiting buttons kee
  assert.match(html,/h2 class="plain"/);
  assert.doesNotMatch(html,/block-hint/);
  assert.match(html,/id="search-toggle"[^>]*title="/);
+ assert.match(html,/id="feed-meter-text"[^>]*>Сообщений: 0</);
+ assert.match(html,/полным контекстным окном/);
+ assert.match(html,/пределе лимита подписки/);
+ assert.match(html,/Сообщений в ленте: <span id="fresh-count-value">0<\/span>/);
+ assert.match(html,/id="fresh-remember"[^>]*>Установить текущее значение</);
+ assert.match(html,/id="auto-privileges"[^>]*>\+привилегии</);
+ assert.match(html,/Собрал очередь — пошёл пить чай/);
+ assert.match(html,/id="privilege-delete"/);
+ assert.match(html,/id="privilege-network"/);
+ assert.match(html,/id="privilege-git"/);
+ assert.match(html,/id="privilege-shell"/);
+ assert.match(html,/id="privilege-unparsed"/);
+ assert.match(html,/id="privilege-other"/);
+ assert.match(css,/#auto-privileges\.selected\{[^}]*background:#c44536/);
+ assert.match(css,/body\.vscode-light #auto-privileges\.selected\{[^}]*background:#b3382c/);
+ assert.match(css,/#privilege-dialog \.privilege-box input\{[^}]*width:auto/);
+ assert.match(css,/#privilege-dialog \.privilege-box span\{[^}]*min-width:0/);
+ // Anton's layout: queue how-to and first-cycle text on the left, the old dialog on the right.
+ assert.equal((html.match(/class="privilege-block/g)||[]).length,4);
+ assert.match(html,/<h3 id="queue-how-title">Как сделать очередь<\/h3>/);
+ assert.match(html,/id="queue-copy"[^>]*>Скопировать в буфер</);
+ assert.match(html,/Если вопросов нет, напиши «Вопросов нет»/);
+ assert.match(css,/#privilege-dialog \.privilege-grid\{[^}]*grid-template-columns:minmax\(0,1fr\) minmax\(0,1fr\)/);
+ assert.match(css,/#privilege-dialog \.privilege-block\{[^}]*border-radius:var\(--radius\)/);
+ assert.match(html,/id="privilege-all"[^>]*>Всё<\/button>\s*<button id="privilege-ok"[^>]*>Ок<\/button>\s*<button id="privilege-cancel"[^>]*>Отмена<\/button>/);
+ assert.match(css,/#privilege-dialog\[open\]\{[^}]*overflow:hidden/);
+ assert.match(css,/#privilege-dialog \.privilege-grid\{[^}]*grid-template-rows:minmax\(0,max-content\) minmax\(9rem,1fr\)/);
+ assert.match(css,/#privilege-dialog \.privilege-fit\{[^}]*align-self:start/);
+ assert.match(css,/#privilege-dialog \.privilege-block:nth-child\(n\+3\) \.privilege-body\{[^}]*overflow:auto/);
+ assert.match(css,/#privilege-dialog \.privilege-actions\.choices\{[^}]*grid-template-columns:minmax\(0,1fr\) minmax\(0,1fr\) minmax\(0,1fr\)/);
+ assert.match(fs.readFileSync('webview/main.js','utf8'),/post\('copy', \{text\}/);
+ assert.match(css,/#fresh-agents\{[^}]*grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/);
+ assert.match(css,/#fresh-remember\{[^}]*width:100%/);
+ assert.match(css,/#fresh-dialog \.dialog-actions button\{[^}]*width:100%/);
+ assert.match(css,/#fresh-dialog \.fresh-column \.dialog-actions\{[^}]*grid-template-columns:minmax\(0,1fr\) minmax\(0,1fr\)/);
+ assert.match(css,/\.feed-meter\{[^}]*width:3\.5cm/);
+ assert.match(css,/\.feed-meter\{[^}]*flex:0 0 3\.5cm/);
+ assert.match(css,/\.feed-meter\{[^}]*margin-right:5mm/);
  assert.match(html,/id="export"[^>]*title="/);
  assert.match(html,/id="import"[^>]*title="/);
  // Above .3 the percentage inside the warning fill drops below 4.5:1 on the dark palette.

@@ -78,3 +78,32 @@ test('extension excludes keep docs and concurrent writers preserve shared blobs'
  assert.equal(await fs.readFile(await beforeFile(a,path.join('docs','a.md'),x.store.blobs),'utf8'),'docs');
  await assert.rejects(beforeFile(a,'old.vsix',x.store.blobs),/не вошёл/);
 });
+
+test('locked refs preserve a finished snapshot and its blobs until the next successful save',
+ {skip:process.platform!=='win32'},async t=>{
+ const {Store}=require('../dist/storage/store');
+ const x=await setup(t);await fs.writeFile(path.join(x.root,'a'),'before');
+ const project=path.join(x.base,'projects','a'),chat=new Store(project),state=await chat.load();
+ await chat.save(state);
+ const target=x.target('a','one');await x.store.create(x.root,target,limits);
+ const reader=await fs.open(path.join(project,'snapshot-refs.json'),'r');
+ try {
+  state.turns.push({id:'one',messageId:'m',recipient:'codex',status:'completed',snapshot:target});
+  await chat.save(state);
+  assert.ok(state.diagnostics.some(s=>s.includes('snapshot-refs:')));
+  await x.store.finish(target);
+  assert.equal(await fs.readFile(await beforeFile(target,'a',x.store.blobs),'utf8'),'before');
+  await fs.access(path.join(project,'snapshot-refs.pending'));
+  // No in-memory flag or live-process pin: a different manager must also preserve it.
+  await fs.writeFile(path.join(target,'active.json'),JSON.stringify({pid:2147483647}));
+  await new SnapshotStorage(x.base,()=>1).prune();
+  assert.equal(await fs.readFile(await beforeFile(target,'a',x.store.blobs),'utf8'),'before');
+ } finally {await reader.close();}
+ await chat.save(state);
+ await assert.rejects(fs.access(path.join(project,'snapshot-refs.pending')),{code:'ENOENT'});
+ await x.store.prune();await fs.access(path.join(target,'manifest.json'));
+ // A successful save releases the guard; normal quota eviction must work again.
+ x.budget(1);await x.store.prune();
+ await assert.rejects(fs.access(target),{code:'ENOENT'});
+ assert.deepEqual(await fs.readdir(x.store.blobs),[]);
+});

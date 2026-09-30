@@ -51,17 +51,14 @@ function field(row: Record<string, unknown>, ...keys: string[]): number | undefi
   for (const key of keys) {const n = number(row[key]); if (n !== undefined) return n;}
 }
 export function joinChunks(text: string, chunk: string): string {
-  if (!text) return chunk;
-  if (!chunk) return text;
-  const left = text[text.length - 1], right = chunk[0];
-  if (/\s/.test(left) || /\s/.test(right)) return text + chunk;
-  const line = text.slice(text.lastIndexOf('\n') + 1).trim();
-  // A live table row is not a sentence. `0.1.48.` + `vsix` used to become two paragraphs.
-  if (line.startsWith('|') && !line.endsWith('|')) return text + chunk;
-  if (left === '.' && /\d/.test(text[text.length - 2] || '')) return text + chunk;
-  if (/[.!?…:]/.test(left) && /[A-Za-zА-ЯЁ]/.test(right)) return text + '\n\n' + chunk;
+  // Stream boundaries carry no paragraph semantics; punctuation can split a path or code.
   return text + chunk;
 }
+// A tool call or thinking between two messages is a new stage, like Codex items and Claude blocks.
+export function stageBreak(text: string): string {
+  return text.trim() ? text.trimEnd() + '\n\n' : text;
+}
+
 function makeTracer(o: RunOptions) {
   const steps: TraceStep[] = [];
   const thoughts = new Map<string, string>();
@@ -975,6 +972,7 @@ async function codex(o: RunOptions): Promise<RunResult> {
   const launch = await resolveCli(o.cli);
   let closing = false;
   let rpc: Rpc, text = '', error = '', denied = '', complete!: () => void, session = o.session || '', accepting = false;
+  let rolloutMiss = '';
   const finished = new Promise<void>(resolve => {complete = resolve;});
   const items = new Map<string, string>();
   const startedItems = new Map<string, any>();
@@ -1126,9 +1124,13 @@ async function codex(o: RunOptions): Promise<RunResult> {
       ? await rpc.request('thread/resume', {...params, threadId: o.session, excludeTurns: false})
       : await rpc.request('thread/start', params);
     session = started.thread.id;
-    await o.onSession(session);
+    // Codex keeps no rollout until it accepts the first message. Saving the id
+    // straight after thread/start left a dead session when the turn died here.
+    const freshThread = !o.session;
+    if (!freshThread) await o.onSession(session);
     accepting = true;
     await startTurn([{type: 'text', text: o.prompt}]);
+    if (freshThread) await o.onSession(session);
     await finished;
     if (!o.signal.aborted) {
       // Same live app-server, no second CLI and no model request. Billing failure
@@ -1141,15 +1143,23 @@ async function codex(o: RunOptions): Promise<RunResult> {
       } catch (e) {o.usage?.({raw: {error: String(e)}}, 'account/rateLimits/read');}
       finally {clearTimeout(timer);}
     }
-  } catch (e) {error = String(e);}
+  } catch (e) {
+    const raw = String(e);
+    // Keep the saved id. A missing file can reappear; a new thread would drop it.
+    if (/no rollout found/i.test(raw)) {
+      rolloutMiss = raw;
+      error = 'Сессия Жеки у Codex не найдена, сбросьте ему контекст.';
+    } else error = raw;
+  }
   finally {questionLife.abort(); tracer.finish(); accepting = false; closing = true; await channel.close();}
   return {text, denied: o.signal.aborted ? undefined : denied || undefined,
-    error: o.signal.aborted || denied ? undefined : error || (!text.trim() ? 'Codex вернул пустой ответ.' : undefined), interrupted: o.signal.aborted, stderr: channel.stderr};
+    error: o.signal.aborted || denied ? undefined : error || (!text.trim() ? 'Codex вернул пустой ответ.' : undefined), interrupted: o.signal.aborted,
+    stderr: rolloutMiss ? (channel.stderr ? channel.stderr + '\n' + rolloutMiss : rolloutMiss) : channel.stderr};
 }
 async function grok(o: RunOptions): Promise<RunResult> {
   const launch = await resolveCli(o.cli);
   let closing = false;
-  let rpc: Rpc, text = '', error = '', session = '', accepting = false;
+  let rpc: Rpc, text = '', error = '', session = '', accepting = false, newStage = false;
   const compacted = compactOnce(o);
   const tracer = makeTracer(o);
   o.progress('Гриха: запуск агента');
@@ -1172,13 +1182,18 @@ async function grok(o: RunOptions): Promise<RunResult> {
     const update = p.update;
     if (update?.sessionUpdate === 'agent_thought_chunk' || update?.sessionUpdate === 'thought') {
       const chunk = update.content?.text ?? update.text;
-      if (chunk) tracer.thought(String(chunk));
+      if (chunk) {tracer.thought(String(chunk)); newStage = true;}
     }
     if (update?.sessionUpdate === 'agent_message_chunk') {
       const chunk = update.content?.text;
-      if (chunk) {text = joinChunks(text, chunk); o.text(text);}
+      if (chunk) {
+        if (newStage) text = stageBreak(text);
+        newStage = false;
+        text = joinChunks(text, chunk); o.text(text);
+      }
     }
     if (update?.sessionUpdate === 'tool_call' || update?.sessionUpdate === 'tool_call_update') {
+      newStage = true;
       const title = update.title || update.kind || 'Гриха работает';
       o.progress(title);
       const done = /^(completed|failed|success)$/i.test(String(update.status || ''));

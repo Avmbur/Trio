@@ -5,7 +5,7 @@ const path=require('node:path');
 const os=require('node:os');
 const {runProvider,remainingTimer,readUsage,sumTokens,isAutoCompact,formatUsage,readProviderUsage,extractQuota,extractQuotas,
   claudeAccessToken,readClaudeOauthUsage,grokAccessToken,normalizeGrokBilling,redactSecrets,clearUsageCache,expiryMs,
-  parseAgentQuestions,withCustomAnswers,grokQuestionResult,spendTokens,spendHint,extractCliVersion,rememberCli,rememberedCli,pickContextWindow,joinChunks,
+  parseAgentQuestions,withCustomAnswers,grokQuestionResult,spendTokens,spendHint,extractCliVersion,rememberCli,rememberedCli,pickContextWindow,joinChunks,stageBreak,
   parseResetAt,claudeLaunchSettings,isolatedEngineEnv}=require('../dist/providers/adapter');
 for(const provider of ['codex','claude','grok']){
  test(provider+' native adapter handshake, streaming, permission and final response',{timeout:20000,skip:process.platform!=='win32'},async t=>{
@@ -23,8 +23,11 @@ for(const provider of ['codex','claude','grok']){
     const q=extractQuota(report.raw); if(q) quota=q.percent;
    },
    permission:async()=>{permissions++;return true;},compacted:()=>{compacts++;}});
-  assert.equal(result.error,undefined);assert.equal(result.interrupted,false);assert.equal(result.text,'Начало готово');
-  assert.equal(permissions,1);assert.ok(session);assert.ok(chunks.includes('Начало '));assert.equal(chunks.at(-1),'Начало готово');
+  // Grok streams all stages as one message; a tool call between them starts a new paragraph,
+  // while chunks inside a stage join as is.
+  const answer=provider==='grok'?'Начало\n\nготово':'Начало готово';
+  assert.equal(result.error,undefined);assert.equal(result.interrupted,false);assert.equal(result.text,answer);
+  assert.equal(permissions,1);assert.ok(session);assert.ok(chunks.includes('Начало '));assert.equal(chunks.at(-1),answer);
   if(provider==='grok'){
     assert.ok(trace.some(s=>s.kind==='thought'&&/сверю/i.test(s.title)));
     assert.ok(trace.some(s=>s.kind==='tool'&&/Read adapter/.test(s.title)));
@@ -385,15 +388,25 @@ test('Trio launches never enable remote control',()=>{
  assert.equal(env.GROK_AGENT_DASHBOARD,'0');
  assert.equal(env.ANTHROPIC_API_KEY,undefined);
 });
-test('joinChunks inserts a blank line between glued sentences and leaves a live stream alone',()=>{
- assert.equal(joinChunks('пачкой.','Вношу правки'),'пачкой.\n\nВношу правки');
- assert.equal(joinChunks('Начало ','готово'),'Начало готово');
- assert.equal(joinChunks('Hel','lo'),'Hello');
- assert.equal(joinChunks('','Первое'),'Первое');
- assert.equal(joinChunks('trio-chat-0.1.48.','vsix'),'trio-chat-0.1.48.vsix');
- assert.equal(joinChunks('| 1. Install `trio-chat-0.1.48.','vsix` → Reload | шапка |'),
-  '| 1. Install `trio-chat-0.1.48.vsix` → Reload | шапка |');
+test('Grok text is identical at every stream split, including filenames and Markdown',()=>{
+ const samples=[
+  'trio.feedMaxMessages .gitignore *.vsix check:release codex:execute',
+  '\\server\\folder\\file.txt https://example.test/a?q=x#part',
+  '\u0413\u043e\u0442\u043e\u0432\u043e.\u0414\u0430\u043b\u044c\u0448\u0435',
+  'Done.\n\nNext paragraph: here!',
+  '\u0060trio.feedMaxMessages\u0060 and \u0060.gitignore\u0060',
+  '\u0060\u0060\u0060text\n.gitignore\ncheck:release\n\u0060\u0060\u0060',
+  '| file | value |\n| --- | --- |\n| trio-chat-1.0.3.vsix | yes |'
+ ];
+ for(const sample of samples){
+  for(let at=0;at<=sample.length;at++)assert.equal(joinChunks(sample.slice(0,at),sample.slice(at)),sample);
+  assert.equal([...sample].reduce(joinChunks,''),sample);
+ }
+ assert.equal(stageBreak(''),'');
+ assert.equal(stageBreak('Сначала посмотрю. '),'Сначала посмотрю.\n\n');
+ assert.equal(stageBreak('Готово.\n\n'),'Готово.\n\n');
 });
+
 test('pickContextWindow prefers the modelUsage row that matches top-level usage, not the first window',()=>{
  const modelUsage={
   'claude-haiku-4-5':{contextWindow:200000,inputTokens:28183,outputTokens:40},

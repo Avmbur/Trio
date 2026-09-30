@@ -5,7 +5,7 @@ const path = require('node:path');
 const os = require('node:os');
 const {Controller} = require('../dist/orchestrator/controller');
 const {Store} = require('../dist/storage/store');
-const {fresh, addressed, assignedMode, input, riskyPermission, permissionClass, permissionSignature, permissionCaption, diskImagePath, plainAttachment, context, contextFit, questionNumber, messageText, agentPromptPrefix, instructionLimit, normalizeInstruction} = require('../dist/shared/model');
+const {fresh, addressed, assignedMode, input, riskyPermission, permissionClass, permissionSignature, permissionCaption, diskImagePath, plainAttachment, context, contextFit, questionNumber, messageText, agentPromptPrefix, instructionLimit, normalizeInstruction, summaryPrompt, summaryComfort, dangerCover, privilegeIds} = require('../dist/shared/model');
 const {brief} = require('../dist/orchestrator/controller');
 test('a tool title never reaches the feed as a wall of script',()=>{
   const script='node -e "'+'const x=1; '.repeat(200)+'"';
@@ -178,6 +178,17 @@ test('permissionClass splits command chains and ignores heredoc and quoted paylo
  assert.equal(permissionClass('Выполнение команды', JSON.stringify({command:'git add src/a.ts'})),'command');
  assert.equal(permissionClass('Изменение файлов', JSON.stringify({path:'a.ts'})),'edit');
  assert.equal(permissionClass('Execute broken', JSON.stringify({kind:'execute',rawInput:{command:"echo 'oops"}})),'danger');
+ assert.deepEqual(dangerCover('Execute git', JSON.stringify({kind:'execute',rawInput:{command:'git commit -m x'}})),{needs:['git'],safeCommand:false});
+ assert.deepEqual(dangerCover('Execute chain', JSON.stringify({kind:'execute',rawInput:{command:'git add x && git commit -m x'}})),{needs:['git'],safeCommand:true});
+ assert.deepEqual(dangerCover('Execute mix', JSON.stringify({kind:'execute',rawInput:{command:'rm a && curl https://example.test'}})),{needs:['network','shell'],safeCommand:false});
+ assert.deepEqual(dangerCover('Execute broken', JSON.stringify({kind:'execute',rawInput:{command:"echo 'oops"}})),{needs:['unparsed'],safeCommand:false});
+ assert.deepEqual(dangerCover('Выполнение команды', JSON.stringify({command:'powershell -EncodedCommand cgBtACAALQByACAAeAA=',kind:'danger'})),{needs:['unparsed'],safeCommand:false});
+ assert.deepEqual(dangerCover('Выполнение команды', JSON.stringify({command:'',kind:'danger'})),{needs:['unparsed'],safeCommand:false});
+ assert.deepEqual(dangerCover('Web Fetch', JSON.stringify({kind:'web_fetch'})),{needs:['network'],safeCommand:false});
+ assert.deepEqual(dangerCover('Изменение файлов', JSON.stringify({type:'delete',path:'a.ts'})),{needs:['delete'],safeCommand:false});
+ assert.deepEqual(dangerCover('mcp__other__tool', '{}'),{needs:['other'],safeCommand:false});
+ assert.equal(dangerCover('Execute tsc', JSON.stringify({kind:'execute',rawInput:{command:'node --test tests'}})),undefined);
+ assert.equal(dangerCover('Read file', JSON.stringify({kind:'read'})),undefined);
 });
 test('permissions are bound to a pending request and stop resolves denial',async t=>{
   let started;const ready=new Promise(r=>started=r);let decision;
@@ -338,6 +349,9 @@ test('invalid UI messages and unknown permission fields are rejected',()=>{
   assert.ok(input({type:'agent',agent:{...agent,instruction:'кратко'}}));
   assert.equal(input({type:'agent',agent:{...agent,instruction:'x'.repeat(instructionLimit+1)}}),undefined);
   assert.equal(input({type:'send',text:'x',recipient:'both'}),undefined);
+  assert.deepEqual(input({type:'copy',text:'план',clientId:'c'}),{type:'copy',text:'план'});
+  assert.equal(input({type:'copy',text:'x'.repeat(20001)}),undefined);
+  assert.equal(input({type:'copy'}),undefined);
   assert.equal(input({type:'permission',requestId:4,allow:true}),undefined);
   assert.equal(input({type:'answer',requestId:'x',answers:{q:'y'.repeat(2001)}}),undefined);
   assert.equal(input({type:'answer',requestId:'x',answers:Object.fromEntries([...Array(9)].map((_,i)=>['q'+i,'a']))}),undefined);
@@ -742,6 +756,11 @@ test('UI order and reset input validates providers, duplicates, epoch and action
  assert.equal(input({type:'send',text:'x',recipient:'all',conversationId:4}),undefined);
  assert.equal(input({type:'reset',mode:'delete-files'}),undefined);
  assert.ok(input({type:'reset',mode:'context'}));
+ assert.ok(input({type:'fresh-summary',provider:'claude'}));
+ assert.equal(input({type:'fresh-summary',provider:'both'}),undefined);
+ assert.ok(input({type:'feed-max',count:1050}));
+ assert.equal(input({type:'feed-max',count:0}),undefined);
+ assert.equal(input({type:'feed-max',count:1.5}),undefined);
  assert.ok(input({type:'usage',provider:'grok'}));
  assert.equal(input({type:'usage',provider:'other'}),undefined);
  assert.ok(input({type:'project'}));
@@ -751,6 +770,9 @@ test('UI order and reset input validates providers, duplicates, epoch and action
  assert.equal(diskImagePath('Изображение на диске: C:/store/images/abc.png\nОткрой его'),'C:/store/images/abc.png');
  assert.equal(plainAttachment({id:'a',label:'x',text:'t',preview:'webview://x'}).preview,undefined);
  assert.ok(input({type:'flags',autoReply:true,autoEdits:true,autoCommands:false}));
+ assert.ok(input({type:'flags',privilegeOn:true,privileges:['git','shell']}));
+ assert.equal(input({type:'flags',privileges:['git','git']}),undefined);
+ assert.equal(input({type:'flags',privileges:['nope']}),undefined);
  assert.ok(input({type:'save-image',id:'abc.png'}));
  assert.ok(input({type:'answer',requestId:'r',answers:{'Цвет?':'синий'}}));
  assert.equal(input({type:'answer',requestId:'r',answers:[]}),undefined);
@@ -925,6 +947,60 @@ test('auto-commands allow a read the same way auto-edits do',async t=>{
  await c.send('Колян, посмотри','claude');await c.idle();
  assert.ok(state.messages.some(m=>m.text==='Автоправки: Колян'));
  assert.equal(c.permissions.length,0);
+});
+test('privileges allow a checked git commit and still ask for an unchecked delete',async t=>{
+ const {c,state}=await fixture(t,async o=>{
+  const git=await o.permission('Execute git',JSON.stringify({kind:'execute',rawInput:{command:'git commit -m x'}}));
+  const pending=o.permission('Bash','rm -rf build');
+  while(!c.permissions.length)await new Promise(r=>setImmediate(r));
+  c.permission(c.permissions[0].id,false);
+  const removed=await pending;
+  return {text:String(git)+'/'+String(removed),interrupted:false};
+ });
+ await c.setFlags({privilegeOn:true,privileges:['git']});
+ await c.send('Колян, делай коммит','claude');await c.idle();
+ assert.equal(state.turns[0].mode,'execute');
+ assert.ok(state.messages.some(m=>m.text==='Автопривилегии: Колян'));
+ assert.ok(state.messages.some(m=>/Отказано/.test(m.text)&&/Bash/.test(m.text)));
+ assert.equal(state.messages.find(m=>m.author==='Колян').text,'true/false');
+});
+test('a chain of an ordinary command and git needs both the checkbox and auto-commands',async t=>{
+ const detail=JSON.stringify({kind:'execute',rawInput:{command:'npm test && git commit -m x'}});
+ const once=async(privileges,autoCommands)=>{
+  const {c,state}=await fixture(t,async o=>{
+   const decision=o.permission('Execute chain',detail);
+   if(c.permissions.length)c.permission(c.permissions[0].id,false);
+   return {text:String(await decision),interrupted:false};
+  });
+  await c.setFlags({privilegeOn:true,privileges,autoCommands});
+  await c.send('Колян, делай цепочку','claude');await c.idle();
+  return state.messages.find(m=>m.author==='Колян').text;
+ };
+ assert.equal(await once(['git'],false),'false');
+ assert.equal(await once(['git'],true),'true');
+});
+test('privileges do not skip a danger request while the turn is in read mode',async t=>{
+ const {c,state}=await fixture(t,async o=>{
+  const decision=o.permission('Execute git',JSON.stringify({kind:'execute',rawInput:{command:'git push'}}));
+  if(c.permissions.length)c.permission(c.permissions[0].id,false);
+  return {text:String(await decision),interrupted:false};
+ });
+ await c.setFlags({privilegeOn:true,privileges:[...privilegeIds]});
+ await c.send('Колян, посмотри и не трогай','claude');await c.idle();
+ assert.equal(state.turns[0].mode,'discuss');
+ assert.equal(state.messages.find(m=>m.author==='Колян').text,'false');
+ assert.equal(state.messages.some(m=>m.text==='Автопривилегии: Колян'),false);
+});
+test('stop everyone turns auto-reply off and leaves privileges on',async t=>{
+ const {c,state,store}=await fixture(t);
+ await c.setFlags({autoReply:true,privilegeOn:true,privileges:['git','shell']});
+ await c.stop();
+ assert.equal(state.autoReply,false);
+ assert.equal(state.privilegeOn,true);
+ assert.deepEqual(state.privileges,['git','shell']);
+ const loaded=await store.load();
+ assert.equal(loaded.privilegeOn,true);
+ assert.deepEqual(loaded.privileges,['git','shell']);
 });
 test('auto-actions allow a read and still ask for bash',async t=>{
  const {c,state}=await fixture(t,async o=>{
@@ -1326,5 +1402,430 @@ test('Codex quoted PowerShell uses auto-command flags, while deletion still open
   const allow=autoCommands&&mode==='execute';
   assert.deepEqual(prompted,[allow?0:1,1]);
   assert.equal(state.messages.find(m=>m.author==='Жека').text,allow?'true/false':'false/false');
+ }
+});
+
+test('a summary waits out the current answer, stays in read mode, and replaces the feed',async t=>{
+ let release=()=>{}, entered=()=>{};
+ const gate=new Promise(r=>{release=r;});
+ const started=new Promise(r=>{entered=r;});
+ let calls=0;
+ const {c,state,runs,store}=await fixture(t,async o=>{
+  calls++;
+  if(calls===1){entered();await gate;return {text:'Готовый ответ',interrupted:false};}
+  await o.onSession('summary-session');
+  return {text:'Где остановились',interrupted:false};
+ });
+ state.agents[0].mode='execute';
+ state.agents[0].instruction='пиши кратко';
+ state.agents[2].enabled=true;
+ state.autoReply=true;
+ const sending=c.send('вопрос по проекту','claude');
+ await started;
+ await c.send('Жека, отдельный вопрос','codex');
+ await c.beginSummary('claude');
+ assert.equal(runs.length,1);
+ assert.equal(runs[0].execute,true);
+ assert.equal(state.turns.find(t=>t.summary).mode,'discuss');
+ assert.equal(state.queue[0],state.turns.find(t=>t.summary).id);
+ await assert.rejects(c.send('ещё','claude'),/Сводк/);
+ await assert.rejects(c.handoff('codex'),/Сводк/);
+ release();
+ await sending;
+ await c.idle();
+ assert.deepEqual(runs.map(r=>r.provider),['claude','claude']);
+ assert.equal(runs[1].execute,false);
+ assert.match(runs[1].prompt,/Не изменяй файлы/);
+ assert.match(runs[1].prompt,/Готовый ответ/);
+ assert.ok(runs[1].prompt.includes(summaryPrompt));
+ assert.equal(state.messages.length,1);
+ assert.equal(state.messages[0].author,'Колян');
+ assert.equal(state.messages[0].text,'Где остановились\n\n'+summaryComfort);
+ assert.deepEqual(state.sessions,{});
+ assert.equal(state.agents[0].mode,'execute');
+ assert.equal(state.agents[0].instruction,'пиши кратко');
+ assert.equal(state.autoReply,false);
+ const archived=await fs.readdir(path.join(store.dir,'archives'));
+ assert.equal(archived.length,1);
+ const old=JSON.parse(await fs.readFile(path.join(store.dir,'archives',archived[0]),'utf8'));
+ assert.ok(old.messages.some(m=>m.text==='вопрос по проекту'));
+ assert.ok(old.messages.some(m=>m.text==='Готовый ответ'));
+});
+
+test('stopping the turn already running cancels the queued summary and keeps the feed',async t=>{
+ let entered=()=>{};
+ const started=new Promise(r=>{entered=r;});
+ const {c,state,runs}=await fixture(t,async o=>{
+  o.text('частично');
+  entered();
+  await new Promise(r=>o.signal.addEventListener('abort',r,{once:true}));
+  return {text:'частично',interrupted:true};
+ });
+ state.messages.push({id:'old',author:'Антон',text:'старое'});
+ const sending=c.send('вопрос по проекту','claude');
+ await started;
+ await c.beginSummary('claude');
+ await c.stop();
+ await sending;
+ await c.idle();
+ assert.equal(runs.length,1);
+ assert.ok(state.messages.some(m=>m.text==='старое'));
+ assert.ok(state.messages.some(m=>m.text==='вопрос по проекту'));
+ assert.ok(state.messages.some(m=>/не закончился ответом/.test(m.text)));
+ assert.ok(!state.messages.some(m=>m.text.includes(summaryComfort)));
+});
+
+test('an empty summary and a failed archive both keep the old feed',async t=>{
+ const empty=await fixture(t,async()=>({text:'  \n',interrupted:false}));
+ empty.state.messages.push({id:'old',author:'Антон',text:'старое'});
+ await empty.c.beginSummary('claude');
+ await empty.c.idle();
+ assert.ok(empty.state.messages.some(m=>m.text==='старое'));
+ assert.ok(empty.state.messages.some(m=>/сводка пустая/.test(m.text)));
+ assert.ok(!empty.state.messages.some(m=>m.text.includes(summaryComfort)));
+ const failed=await fixture(t,async()=>({text:'Где остановились',interrupted:false}));
+ failed.state.messages.push({id:'old',author:'Антон',text:'старое'});
+ failed.store.archive=async()=>{throw new Error('диск занят');};
+ await failed.c.beginSummary('claude');
+ await failed.c.idle();
+ assert.ok(failed.state.messages.some(m=>m.text==='старое'));
+ assert.ok(failed.state.messages.some(m=>m.text==='Где остановились'));
+ assert.ok(failed.state.messages.some(m=>/архив не сохранился/.test(m.text)));
+ assert.ok(!failed.state.messages.some(m=>m.text.includes(summaryComfort)));
+});
+
+test('a disabled participant cannot write the summary, and reload drops a queued one',async t=>{
+ const {c,state}=await fixture(t);
+ await assert.rejects(c.beginSummary('grok'),/выключен/);
+ state.messages.push({id:'m',author:'Антон',text:summaryPrompt,turn:'s'});
+ state.turns.push({id:'s',messageId:'m',recipient:'claude',status:'proposed',summary:true,mode:'discuss'});
+ state.queue.push('s');
+ await c.recover();
+ assert.equal(state.turns.find(t=>t.id==='s').status,'interrupted');
+ assert.equal(state.queue.includes('s'),false);
+ assert.ok(state.messages.some(m=>/закрытием окна/.test(m.text)));
+ await c.send('ещё вопрос','claude');
+ await c.idle();
+ assert.ok(state.messages.some(m=>m.author==='Колян'&&m.text.startsWith('Ответ')));
+});
+
+
+test('summary source preserves the full feed across limits, resets and session cursors',async t=>{
+ let raw;
+ const {c,state,host,runs}=await fixture(t,async o=>{raw=await fs.readFile(path.join(o.root,'.trio-summary.md'));return {text:'handoff',interrupted:false};});
+ host.limit=()=>2000;
+ state.messages.push(
+  {id:'early',author:'Антон',text:'EARLY_FACT\r\nbefore reset',attachments:[{id:'a',label:'old.txt',text:'EARLY_ATTACHMENT'}]},
+  {id:'reset',author:'Trio',text:'context reset',control:true},
+  {id:'tail',author:'Колян',text:'TAIL_FACT '+ 'x'.repeat(5000)}
+ );
+ state.contextStart='reset';
+ state.sessions['claude:discuss']={id:'existing-session',project:host.root,profile:'discuss',through:'tail'};
+ host.gitState=async()=>'## main\r\n?? NEW_FILE\r M CHANGED_FILE';
+ state.messages.find(m=>m.id==='early').actions=[{title:'PERMISSION_CARD_NOISE'}];
+ await c.beginSummary('claude');await c.idle();
+ const file=path.join(host.root,'.trio-summary.md');
+ assert.ok(runs[0].prompt.includes(JSON.stringify(file)));
+ assert.match(runs[0].prompt,/Целиком его не читай/);
+ await assert.rejects(fs.stat(file),{code:'ENOENT'});
+ assert.equal(raw.includes(13),false);
+ const source=raw.toString('utf8');
+ assert.match(source,/EARLY_FACT\nbefore reset/);
+ assert.match(source,/Файл old\.txt:\nEARLY_ATTACHMENT/);
+ assert.match(source,/### Колян[^\n]*\nTAIL_FACT/);
+ assert.match(source,/## Git\n\n## main\n\?\? NEW_FILE\n M CHANGED_FILE/);
+ assert.equal(source.includes('PERMISSION_CARD_NOISE'),false);
+ assert.equal(state.messages[0].text,'handoff\n\n'+summaryComfort);
+});
+
+test('summary carries queued questions, attachments, recipients and order into its source',async t=>{
+ let source='';
+ const {c,state,runs}=await fixture(t,async o=>{
+  if(o.prompt.includes('.trio-summary.md'))source=await fs.readFile(path.join(o.root,'.trio-summary.md'),'utf8');
+  return {text:'handoff',interrupted:false};
+ });
+ await c.send('PENDING_FIRST','all',[],[{id:'a',label:'task.txt',text:'PENDING_ATTACHMENT'}]);
+ await c.send('PENDING_SECOND','all',['codex','claude']);
+ await c.idle();
+ const pending=state.queue.slice();
+ assert.ok(pending.length>=2);
+ await c.beginSummary('claude');await c.idle();
+ assert.match(source,/## Очередь \(2\)\n\n1\. #1 → всем\n2\. #2 → Колян/);
+ assert.match(source,/PENDING_FIRST\n\nФайл task\.txt:\nPENDING_ATTACHMENT/);
+ assert.match(source,/PENDING_SECOND/);
+ assert.match(runs.at(-1).prompt,/PENDING_FIRST/);
+ assert.match(runs.at(-1).prompt,/PENDING_ATTACHMENT/);
+ assert.match(runs.at(-1).prompt,/ожидающие исполнения/);
+ assert.deepEqual(state.queue,[]);
+});
+
+test('summary is refused during compaction without creating a blocking turn',async t=>{
+ let entered,release;
+ const started=new Promise(r=>{entered=r;});
+ const gate=new Promise(r=>{release=r;});
+ const {c,state,host,runs}=await fixture(t,withSession);
+ await c.send('initial','claude');await c.idle();
+ host.compact=async()=>{entered();await gate;};
+ const work=c.compact('claude');await started;
+ try {
+  const before=structuredClone(state);
+  await assert.rejects(c.beginSummary('claude'),/завершения сжатия/);
+  assert.deepEqual(state,before);
+  assert.equal(c.summarizing,false);
+ } finally {release();await work;}
+ await c.beginSummary('claude');await c.idle();
+ assert.equal(runs.length,2);
+ assert.equal(state.messages.length,1);
+ assert.ok(state.messages[0].text.endsWith(summaryComfort));
+});
+
+test('retrying a failed summary retains the handoff and archives before clearing',async t=>{
+ let attempt=0;
+ const {c,state,store,runs}=await fixture(t,async()=>++attempt===1
+  ? {text:'',error:'temporary failure',interrupted:false}
+  : {text:'retried handoff',interrupted:false});
+ state.agents[0].mode='execute';
+ state.messages.push({id:'old',author:'Антон',text:'KEEP_IN_ARCHIVE'});
+ await c.beginSummary('claude');await c.idle();
+ const failed=state.turns.find(t=>t.summary);
+ assert.equal(failed.status,'failed');
+ Object.assign(state,await store.load());
+ await c.retry(failed.id);await c.idle();
+ assert.equal(runs.length,2);
+ assert.equal(runs[1].execute,false);
+ assert.equal(state.messages.length,1);
+ assert.equal(state.messages[0].text,'retried handoff\n\n'+summaryComfort);
+ const files=await fs.readdir(path.join(store.dir,'archives'));
+ assert.equal(files.length,1);
+ const archived=JSON.parse(await fs.readFile(path.join(store.dir,'archives',files[0]),'utf8'));
+ assert.ok(archived.messages.some(m=>m.text==='KEEP_IN_ARCHIVE'));
+ assert.equal(archived.turns.filter(t=>t.summary).length,2);
+ assert.deepEqual(state.sessions,{});
+});
+
+test('failure to write the full summary source keeps the conversation and skips the CLI',async t=>{
+ const {c,state,store,runs}=await fixture(t);
+ state.messages.push({id:'old',author:'Антон',text:'KEEP'});
+ store.summarySource=async()=>{throw new Error('source unavailable');};
+ await c.beginSummary('claude');await c.idle();
+ assert.equal(runs.length,0);
+ assert.ok(state.messages.some(m=>m.text==='KEEP'));
+ assert.equal(state.turns.find(t=>t.summary).status,'failed');
+ assert.equal(c.summarizing,false);
+ assert.ok(state.messages.some(m=>m.text.includes('source unavailable')));
+});
+
+
+for (const provider of ['claude','codex','grok']) {
+ test(provider+' can prepare a new conversation with the complete source in read mode',async t=>{
+  const {c,state,store,host}=await fixture(t,async o=>{
+   assert.equal(o.execute,false);
+   // Inside the project root, where every engine reads in Чтение without extra grants.
+   const file=path.join(o.root,'.trio-summary.md');
+   assert.ok(o.prompt.includes(JSON.stringify(file)));
+   assert.match(await fs.readFile(file,'utf8'),/EARLY_SUMMARY_FACT/);
+   return {text:'Preserved EARLY_SUMMARY_FACT',interrupted:false};
+  });
+  state.agents.find(a=>a.id===provider).enabled=true;
+  state.agents.find(a=>a.id===provider).mode='execute';
+  state.messages.push({id:'old',author:'Антон',text:'EARLY_SUMMARY_FACT'});
+  await c.beginSummary(provider);await c.idle();
+  assert.equal(state.messages.length,1);
+  assert.ok(state.messages[0].text.endsWith(summaryComfort));
+  const files=await fs.readdir(path.join(store.dir,'archives'));
+  assert.equal(files.length,1);
+  const archive=JSON.parse(await fs.readFile(path.join(store.dir,'archives',files[0]),'utf8'));
+  assert.ok(archive.messages.some(m=>m.text==='EARLY_SUMMARY_FACT'));
+  await assert.rejects(fs.stat(path.join(host.root,'.trio-summary.md')),{code:'ENOENT'});
+ });
+}
+test('a failed or stopped summary still removes its source from the project',async t=>{
+ const {c,state,host}=await fixture(t,async()=>({text:'',error:'boom',interrupted:false}));
+ state.messages.push({id:'old',author:'Антон',text:'KEEP'});
+ await c.beginSummary('claude');await c.idle();
+ assert.ok(state.messages.some(m=>m.text==='KEEP'));
+ await assert.rejects(fs.stat(path.join(host.root,'.trio-summary.md')),{code:'ENOENT'});
+});
+test('recovery after a closed window removes a leftover summary source',async t=>{
+ const {c,state,host}=await fixture(t);
+ const file=path.join(host.root,'.trio-summary.md');
+ await fs.writeFile(file,'leftover');
+ state.messages.push({id:'m',author:'Антон',text:'x',turn:'s'});
+ state.turns.push({id:'s',messageId:'m',recipient:'claude',status:'running',mode:'discuss',summary:true});
+ await c.recover();
+ await assert.rejects(fs.stat(file),{code:'ENOENT'});
+});
+test('.trio-summary.md is ignored by git',()=>{
+ assert.match(require('fs').readFileSync(path.join(__dirname,'..','.gitignore'),'utf8'),/^\.trio-summary\.md\*$/m);
+});
+
+
+for(const status of ['completed','failed','interrupted',undefined]) {
+ test('recovery removes both summary files after '+(status||'a conversation reset'),async t=>{
+  const {c,state,store,host,runs}=await fixture(t);
+  const file=path.join(host.root,'.trio-summary.md');
+  await fs.writeFile(file,'leftover\n','utf8');
+  await fs.writeFile(file+'.tmp','unfinished write\n','utf8');
+  const keep=path.join(host.root,'.trio-summary.md.keep');
+  await fs.writeFile(keep,'unrelated file\n','utf8');
+  state.messages.push({id:'m',author:'Антон',text:'KEEP'});
+  if(status) state.turns.push({id:'s',messageId:'m',recipient:'claude',mode:'discuss',summary:true,status});
+  await store.save(state);
+  await c.recover();
+  await assert.rejects(fs.stat(file),{code:'ENOENT'});
+  await assert.rejects(fs.stat(file+'.tmp'),{code:'ENOENT'});
+  assert.equal(await fs.readFile(keep,'utf8'),'unrelated file\n');
+  assert.ok(state.messages.some(m=>m.text==='KEEP'));
+  assert.equal(state.turns[0]?.status,status);
+  assert.equal(runs.length,0);
+ });
+}
+
+test('failed summary source write removes its temporary file and preserves the feed',async t=>{
+ const {c,state,store,host,runs}=await fixture(t);
+ const file=path.join(host.root,'.trio-summary.md');
+ state.messages.push({id:'m',author:'Антон',text:'KEEP'});
+ store.summarySource=async()=>{
+  await fs.writeFile(file+'.tmp','partial source\n','utf8');
+  throw new Error('summary write failed');
+ };
+ await c.beginSummary('claude');await c.idle();
+ await assert.rejects(fs.stat(file),{code:'ENOENT'});
+ await assert.rejects(fs.stat(file+'.tmp'),{code:'ENOENT'});
+ assert.ok(state.messages.some(m=>m.text==='KEEP'));
+ assert.equal(state.turns.find(t=>t.summary).status,'failed');
+ assert.equal(runs.length,0);
+});
+
+test('stopping a summary removes both source files and keeps the old conversation',async t=>{
+ let entered;
+ const started=new Promise(resolve=>{entered=resolve;});
+ const {c,state,host}=await fixture(t,async o=>{
+  await fs.writeFile(path.join(o.root,'.trio-summary.md.tmp'),'leftover\n','utf8');
+  entered();
+  await new Promise(resolve=>o.signal.addEventListener('abort',resolve,{once:true}));
+  return {text:'partial',interrupted:true};
+ });
+ state.messages.push({id:'m',author:'Антон',text:'KEEP'});
+ const starting=c.beginSummary('claude');
+ await started;
+ await c.stop();await starting;await c.idle();
+ for(const suffix of ['', '.tmp']) await assert.rejects(fs.stat(path.join(host.root,'.trio-summary.md'+suffix)),{code:'ENOENT'});
+ assert.ok(state.messages.some(m=>m.text==='KEEP'));
+ assert.equal(state.turns.find(t=>t.summary).status,'interrupted');
+});
+
+test('recovery and a rejected summary leave another window source under its lock',async t=>{
+ const {ProjectLock}=require('../dist/processes/lock');
+ const {c,state,host}=await fixture(t);
+ const lock=await ProjectLock.for(host.root,host.lockBase);
+ await lock.acquire();
+ const file=path.join(host.root,'.trio-summary.md');
+ await fs.writeFile(file,'another window\n','utf8');
+ await fs.writeFile(file+'.tmp','another window temp\n','utf8');
+ try {
+  await c.recover();
+  await c.beginSummary('claude');await c.idle();
+  assert.equal(await fs.readFile(file,'utf8'),'another window\n');
+  assert.equal(await fs.readFile(file+'.tmp','utf8'),'another window temp\n');
+  assert.equal(state.turns.find(t=>t.summary).status,'failed');
+ } finally {await lock.release();}
+ await c.recover();
+ await assert.rejects(fs.stat(file),{code:'ENOENT'});
+ await assert.rejects(fs.stat(file+'.tmp'),{code:'ENOENT'});
+});
+test('a missing Codex rollout keeps the saved session',async t=>{
+ const {c,state,runs}=await fixture(t,async()=>({
+  text:'',error:'Сессия Жеки у Codex не найдена, сбросьте ему контекст.',interrupted:false
+ }));
+ state.sessions['codex:discuss']={id:'live-thread',project:c.host.root,profile:'discuss',through:'kept'};
+ await c.send('посмотри файл','codex');await c.idle();
+ assert.equal(runs[0].session,'live-thread');
+ assert.equal(state.sessions['codex:discuss'].id,'live-thread');
+ assert.equal(state.sessions['codex:discuss'].through,'kept');
+ assert.ok(state.messages.some(m=>m.error&&m.text==='Сессия Жеки у Codex не найдена, сбросьте ему контекст.'));
+});
+test('a locked snapshot-refs file does not fail the turn',{timeout:30000,skip:process.platform!=='win32'},async t=>{
+ const {c,state,store}=await fixture(t,async o=>{
+  await o.onSession('session-'+o.provider);
+  return {text:'Ответ '+o.provider,interrupted:false};
+ });
+ await c.send('первый','claude');await c.idle();
+ const reader=await fs.open(path.join(store.dir,'snapshot-refs.json'),'r');
+ try {
+  await c.send('второй','claude');await c.idle();
+  assert.equal(state.turns.at(-1).status,'completed');
+  assert.equal(state.sessions['claude:discuss'].id,'session-claude');
+  assert.ok(state.diagnostics.some(line=>/snapshot-refs:/.test(line)&&/EPERM/.test(line)));
+  assert.equal(state.messages.some(m=>m.error&&/EPERM|snapshot-refs|сохранить чат/.test(m.text)),false);
+ } finally {await reader.close();}
+});
+
+test('git global options keep dangerous subcommands behind the git checkbox', () => {
+ for (const command of [
+  'git -C repo push', 'git -C "my repo" push', "git -C '' push",
+  'git -c user.name=Anton commit -m x', 'git -c "user.name=Anton User" commit -m "x"',
+  'git -C "my repo" -c a=b --no-pager reset --hard',
+  'git --git-dir=.git rebase main', 'git --work-tree "my repo" push',
+  'git -Crepo -ca=b push', 'git --config-env=a=B commit --amend',
+ ]) {
+  const detail = JSON.stringify({kind:'execute', command});
+  assert.equal(permissionClass('Bash', detail), 'danger', command);
+  assert.deepEqual(dangerCover('Bash', detail), {needs:['git'], safeCommand:false}, command);
+ }
+ for (const command of ['git -C "my repo" status', 'git -c a=b diff']) {
+  assert.equal(permissionClass('Bash', JSON.stringify({command})), 'command', command);
+ }
+ assert.equal(permissionSignature('Bash', JSON.stringify({command:'git -C "my repo" push'})), 'cmd:git push');
+ assert.deepEqual(dangerCover('Bash', JSON.stringify({command:'git status & git -C repo push'})), {needs:['git'],safeCommand:true});
+});
+test('opaque shell requests and deletion metadata cannot use ordinary auto approvals', () => {
+ for (const command of ['', 'powershell -EncodedCommand abc', 'bash -c "rm a"', 'git --unknown-option push', 'git -C']) {
+  const detail = JSON.stringify({kind:'execute',command});
+  assert.equal(permissionClass('Bash',detail),'danger',command);
+  assert.deepEqual(dangerCover('Bash',detail),{needs:['unparsed'],safeCommand:false},command);
+ }
+ for (const detail of [{kind:'edit',operation:'delete'},{kind:'write',type:'remove'}]) {
+  assert.equal(permissionClass('Edit',JSON.stringify(detail)),'danger');
+  assert.deepEqual(dangerCover('Edit',JSON.stringify(detail)),{needs:['delete'],safeCommand:false});
+ }
+});
+test('ordinary auto approvals cannot bypass the selected privilege categories', async t => {
+ for (const checked of [false,true]) {
+  const requests = [
+   ['Bash',{kind:'execute',command:'git -C "my repo" push'}],
+   ['Bash',{kind:'execute',command:'powershell -EncodedCommand abc'}],
+   ['Edit',{kind:'edit',operation:'delete'}]
+  ];
+  const {c,state} = await fixture(t,async o => {
+   const decisions=[];
+   for (const [title,detail] of requests) {
+    const pending=o.permission(title,JSON.stringify(detail));
+    if(c.permissions.length)c.permission(c.permissions[0].id,false);
+    decisions.push(await pending);
+   }
+   return {text:decisions.join('/'),interrupted:false};
+  });
+  await c.setFlags({autoCommands:true,autoEdits:true,privilegeOn:true,privileges:checked?['git','unparsed','delete']:['other']});
+  await c.send('Колян, делай проверку','claude');await c.idle();
+  assert.equal(state.messages.find(m=>m.author==='Колян').text,checked?'true/true/true':'false/false/false');
+ }
+});
+
+test('a Codex patch containing deletion and editing requires both permissions', async t => {
+ const {codexApproval}=require('../dist/providers/codexProtocol');
+ const request=codexApproval('item/fileChange/requestApproval',{changes:[
+  {path:'old.txt',kind:{type:'delete'}},{path:'keep.txt',kind:{type:'update'}}
+ ]});
+ assert.deepEqual(dangerCover(request.title,request.detail),{needs:['delete'],safeCommand:false,safeEdit:true});
+ for (const autoEdits of [false,true]) {
+  const {c,state}=await fixture(t,async o => {
+   const pending=o.permission(request.title,request.detail);
+   if(c.permissions.length)c.permission(c.permissions[0].id,false);
+   return {text:String(await pending),interrupted:false};
+  });
+  await c.setFlags({autoEdits,privilegeOn:true,privileges:['delete']});
+  await c.send('Колян, делай правку','claude');await c.idle();
+  assert.equal(state.messages.find(m=>m.author==='Колян').text,String(autoEdits));
  }
 });

@@ -15,6 +15,10 @@
       <strong>Trio</strong><span id="app-version" title="Версия загруженного расширения">v{{version}}</span>
       <div class="project-slot"><button id="project" class="project-path" type="button" hidden>Проект: …</button></div>
       <nav aria-label="Управление чатом">
+        <div id="feed-meter" class="feed-meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Сообщения ленты">
+          <span id="feed-meter-fill" class="feed-meter-fill"></span>
+          <span id="feed-meter-text" class="feed-meter-text">Сообщений: 0</span>
+        </div>
         <button id="search-toggle" aria-expanded="false" title="Найти по ленте: подсветка совпадений, счётчик, переход стрелками и Enter, Esc закрывает. Номер сообщения: #1, #25, #К76, #Ж34, #Г120.">Поиск</button>
         <button id="export" title="Сохранить всю ленту в Markdown-файл: сообщения, ошибки и пометки о частичных ответах">Экспорт</button><button id="import" title="Прочитать ленту из Markdown-файла в текущий разговор. Агентов не запускает, повторно ничего не отвечает">Импорт</button>
         <button id="swap-panels" title="Поменять переписку и управление местами">⇄ Панели</button>
@@ -52,6 +56,7 @@
             <button id="auto-reply" type="button" aria-pressed="false" title="Следующие вопросы тоже пойдут сами, пока флаг включён. Ошибка, лимит или Стоп одному — слово тебе. Стоп всем гасит флаг.">Автоответ</button>
             <button id="auto-edits" type="button" aria-pressed="false" title="Чтение и запись файлов без окна. Нужен режим Правок. Удаление, сеть и команды всё равно спросят.">+правки</button>
             <button id="auto-commands" type="button" aria-pressed="false" title="Тесты, tsc, сборка, обычный Bash без окна. Git-коммит, push, удаление и сеть спросят. Нужны Правки.">+команды</button>
+            <button id="auto-privileges" type="button" aria-pressed="false" title="Опасные действия без окна, для очереди. Первое нажатие открывает выбор, повторное выключает.">+привилегии</button>
           </div>
           <div id="composer-tools" class="composer-tools">
             <button id="attach" type="button" class="attach" title="Прикрепить выделение, открытый файл или любой другой файл" disabled>+ Код…</button>
@@ -101,7 +106,7 @@
             <div class="conversation-actions">
               <button id="compact-all" title="Сжать контекст всем: каждый движок сожмёт свою историю сам. Лента Trio не меняется. Это обращение к модели.">Сжать</button>
               <button id="reset-context" title="Сбросить контекст всем: история на экране останется, но агенты начнут с чистой сессии и её не получат. Ожидающие ответы будут сняты. Файлы проекта не трогаем.">Сбросить</button>
-              <button id="new-conversation" title="Новый разговор: лента, черновик, очередь и сессии очищаются, настройки участников остаются. Лента уйдёт в архив Trio, файлы проекта не трогаем. Нужен второй клик.">Новый</button>
+              <button id="new-conversation" title="Новый разговор: выбрать, кто подготовит сводку. Лента очистится только после успешного ответа. Настройки участников остаются, файлы проекта не трогаем.">Новый</button>
               <button id="archives" title="Открыть папку архивов Trio вне проекта: туда уходит лента перед очисткой">Архив</button>
             </div>
           </section>
@@ -182,6 +187,76 @@
         <button id="snippet-duplicate" type="button">Дублировать</button>
         <button id="snippet-cancel" type="button">Отмена</button>
         <button id="snippet-save" type="button" class="primary">Сохранить</button>
+      </div>
+    </dialog>
+    <dialog id="privilege-dialog" aria-labelledby="privilege-title">
+      <h2 id="privilege-title">Привилегии</h2>
+      <div class="privilege-grid">
+        <section class="privilege-block privilege-fit" aria-labelledby="queue-how-title">
+          <h3 id="queue-how-title">Как сделать очередь</h3>
+          <div class="privilege-body">
+          <ol class="queue-steps">
+            <li>Собери план всей очереди: задания, порядок, исполнители и ожидаемый результат.</li>
+            <li>Первый цикл — только уточнения. Скопируй текст ниже, вставь в поле ввода и допиши после него свой план очереди.</li>
+            <li>Ответь на вопросы агентов в их окнах: выбирай предложенный вариант или вписывай свой.</li>
+            <li>Проверь режим «Правки» у нужных участников, отметь привилегии справа и запускай очередь.</li>
+          </ol>
+          </div>
+        </section>
+        <section class="privilege-block" aria-labelledby="privilege-about-title">
+          <h3 id="privilege-about-title">Режим очереди</h3>
+          <div class="privilege-body">
+          <p class="privilege-note">Это для очереди и только для тех, кто понимает, что включает. Отмеченное Trio не спрашивает, очередь идёт дальше. Собрал очередь — пошёл пить чай. Дойти до конца она из-за этого не обязана: остаются лимиты подписки и ошибки движков.</p>
+          <p class="privilege-note">Не собирай очередь, когда счётчик сообщений близок к максимуму. Возможны тормоза и отказы Trio из-за перегрузки ленты.</p>
+          <p class="privilege-note">Если в одной команде обычная часть соседствует с отмеченной, нужны и галочка, и «+команды».</p>
+          <p class="privilege-note">Вопросы агентов эта кнопка не отключает: новый вопрос посреди работы остановит очередь. Для этого и нужен первый цикл.</p>
+          <p id="privilege-reading" class="privilege-reading" hidden></p>
+          </div>
+        </section>
+        <section class="privilege-block" aria-labelledby="queue-text-title">
+          <h3 id="queue-text-title">Текст первого цикла</h3>
+          <div id="queue-template" class="queue-template privilege-body">
+            <p>Это будет автоматическая работа всех троих или назначенных участников. Следующие сообщения из очереди будут поступать после того, как участники ответят на предыдущее или выполнят задание.</p>
+            <p>Сейчас первый цикл — только уточнения, без изменений кода. Ниже план всей очереди. Изучи его и задай сейчас вопросы, которые могут помешать выполнению без моего участия.</p>
+            <p>Каждый — до 20 необходимых вопросов, можно меньше. Учитывай вопросы и ответы предыдущих участников: не повторяй уже заданное, сокращай свой список. Задавай вопросы через модальные окна, чтобы я мог выбирать ответы, а при необходимости вводить свой. Если предлагаешь варианты, отметь рекомендуемый и кратко объясни почему. Если вопросов нет, напиши «Вопросов нет».</p>
+            <p>Я отвечу перед запуском второго цикла. Во втором цикле начнётся реализация уже без моего участия.</p>
+          </div>
+          <div class="privilege-actions">
+            <button id="queue-copy" type="button">Скопировать в буфер</button>
+          </div>
+        </section>
+        <section class="privilege-block" aria-labelledby="privilege-boxes-title">
+          <h3 id="privilege-boxes-title">Без окна разрешения</h3>
+          <div id="privilege-boxes" class="privilege-body">
+            <label class="privilege-box"><input id="privilege-delete" type="checkbox"> <span>Удаление. Удаление файлов без окна.</span></label>
+            <label class="privilege-box"><input id="privilege-network" type="checkbox"> <span>Сеть. Поиск, загрузка страниц, curl и wget без окна.</span></label>
+            <label class="privilege-box"><input id="privilege-git" type="checkbox"> <span>Git. git commit, push, reset, rebase и amend без окна.</span></label>
+            <label class="privilege-box"><input id="privilege-shell" type="checkbox"> <span>Опасная оболочка. rm, del и похожие команды без окна.</span></label>
+            <label class="privilege-box"><input id="privilege-unparsed" type="checkbox"> <span>Неразобранная команда. Команда, которую Trio не разобрал, без окна.</span></label>
+            <label class="privilege-box"><input id="privilege-other" type="checkbox"> <span>Прочие запросы. Всё, что не чтение, не запись и не обычная команда, без окна.</span></label>
+          </div>
+          <div class="privilege-actions choices">
+            <button id="privilege-all" type="button">Всё</button>
+            <button id="privilege-ok" type="button" class="primary">Ок</button>
+            <button id="privilege-cancel" type="button">Отмена</button>
+          </div>
+        </section>
+      </div>
+    </dialog>
+    <dialog id="fresh-dialog" aria-labelledby="fresh-title">
+      <h2 id="fresh-title">Новый разговор</h2>
+      <ol class="fresh-warn">
+        <li>Не стоит начинать новый разговор агентом с полным контекстным окном, потому что оно может начать сжиматься в самый неподходящий момент.</li>
+        <li>Не стоит этого делать на пределе лимита подписки.</li>
+      </ol>
+      <div id="fresh-agents" role="group" aria-label="Кто готовит сводку"></div>
+      <div class="fresh-column">
+        <p id="fresh-count" class="fresh-count">Сообщений в ленте: <span id="fresh-count-value">0</span></p>
+        <button id="fresh-remember" type="button">Установить текущее значение</button>
+        <div class="dialog-actions">
+          <button id="fresh-cancel" type="button">Отмена</button>
+          <button id="fresh-go" type="button" class="primary">Выполнить</button>
+        </div>
       </div>
     </dialog>
     <dialog id="question-dialog" aria-labelledby="question-title">

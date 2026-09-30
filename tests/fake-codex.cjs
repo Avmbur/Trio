@@ -18,7 +18,9 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  switch(v.method) {
  case 'initialize':result({userAgent:'trio/0.154.0-alpha.6.2 (Windows 10; x86_64)'});break;
  case 'account/read':result({account:{type:'chatgpt'}});break;
- case 'thread/resume':usage(baseline,total(9000,7000,500,300));result({thread:{id:threadId}});break;
+ case 'thread/resume':
+   if(v.params.threadId==='missing'){send({id:v.id,error:{code:-1,message:'no rollout found for thread id missing'}});break;}
+   usage(baseline,total(9000,7000,500,300));result({thread:{id:threadId}});break;
  case 'thread/start':result({thread:{id:threadId}});break;
  case 'account/rateLimits/read':
    if(scenario==='quota-error')send({id:v.id,error:{code:-1,message:'Billing unavailable'}});
@@ -34,6 +36,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    }else{result({turnId});finish();}
    break;
  case 'turn/start':
+   if(v.params.input?.[0]?.text==='start-fail'){send({id:v.id,error:{code:-1,message:'turn rejected'}});break;}
    if(scenario.startsWith('async') && !v.params.input[0].text.startsWith('async')){
      turnId='turn-answer';result({turn:{id:turnId}});finish();break;
    }

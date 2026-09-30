@@ -44,7 +44,10 @@ if(args[0]==='auth'){
    }
    if(v.id==='approval'&&v.result){
     const text=v.result.outcome?.optionId==='yes'?'готово':'отказ';
-    send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text}}}});
+    // Live order: the tool finishes, then the next stage of the answer begins.
+    send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'tool_call_update',toolCallId:'t2',title:'fake-test',status:'completed'}}});
+    send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:text.slice(0,2)}}}});
+    send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:text.slice(2)}}}});
     send({jsonrpc:'2.0',id:promptId,result:{stopReason:'end_turn',_meta:{totalTokens:120000,usage:{totalTokens:545449,modelCalls:3}}}});
    }
   }else if(args[0]==='app-server'){

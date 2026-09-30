@@ -7,6 +7,7 @@
   const genitive = {'Колян': 'Коляна', 'Жека': 'Жеки', 'Гриха': 'Грихи'};
   const dative = {claude: 'Коляну', codex: 'Жеке', grok: 'Грихе'};
   const authors = {'Колян': 'claude', 'Жека': 'codex', 'Гриха': 'grok', 'Антон': 'human', Trio: 'system'};
+  const summaryAuthor = 'Trio · кнопка «Новый»';
   let snapshot, initialized = false, nextRequest = 0, sendPending = false, attaching = false, resetPending = false;
   let responseOrder = [], attachments = [], draftTimer, agentSignature = '', queueSignature = '';
   let layout = {side: 'right', width: 400}, dragging = false;
@@ -771,18 +772,23 @@
       if (turn.status === 'completed') actions.append(element('span', 'done', prefix + names[turn.executor] + ' ✓'));
       else if (turn.status === 'running' || turn.status === 'preparing') actions.append(element('span', 'done', prefix + names[turn.executor] + '…'));
       else if (state.queue.includes(turn.id)) {
-        for (const a of state.agents.filter(a => a.enabled && (turn.recipient === 'all' || a.id === turn.recipient))) {
-          const ready = !busy && pending[0]?.id === turn.id;
-          const going = !!state.autoReply && busy;
-          const control = button(prefix + names[a.id] + '\n' + (going ? 'пойдёт сам' : 'ответить'),
-            () => post('handoff', {provider: a.id, turnId: turn.id}),
-            !ready, ready ? 'next' : '');
-          control.title = going
-            ? names[a.id] + ' пойдёт сам по автоответу'
-            : 'Разрешить один ответ ' + names[a.id] + ' на вопрос #' + questionNumber(state, messageId);
-          actions.append(control);
+        if (turn.summary) {
+          actions.append(element('span', 'done', 'сводка следом'));
+          actions.append(button('Снять', () => post('discard', {turnId: turn.id}), resetPending, 'cancel'));
+        } else {
+          for (const a of state.agents.filter(a => a.enabled && (turn.recipient === 'all' || a.id === turn.recipient))) {
+            const ready = !busy && pending[0]?.id === turn.id;
+            const going = !!state.autoReply && busy;
+            const control = button(prefix + names[a.id] + '\n' + (going ? 'пойдёт сам' : 'ответить'),
+              () => post('handoff', {provider: a.id, turnId: turn.id}),
+              !ready, ready ? 'next' : '');
+            control.title = going
+              ? names[a.id] + ' пойдёт сам по автоответу'
+              : 'Разрешить один ответ ' + names[a.id] + ' на вопрос #' + questionNumber(state, messageId);
+            actions.append(control);
+          }
+          actions.append(button('Снять' + (group.length > 1 ? ' ' + (index + 1) : ''), () => post('discard', {turnId: turn.id}), resetPending, 'cancel'));
         }
-        actions.append(button('Снять' + (group.length > 1 ? ' ' + (index + 1) : ''), () => post('discard', {turnId: turn.id}), resetPending, 'cancel'));
       } else actions.append(element('span', 'done', prefix + (names[turn.executor || turn.recipient] || '') + ' · ' + (turn.status === 'failed' ? 'ошибка' : 'снят')));
     });
     row.append(title, actions); return row;
@@ -803,8 +809,31 @@
     $('older-summary').setAttribute('aria-label', 'Другие ожидающие вопросы: ' + rest.length);
     $('older-rows').replaceChildren(...rest.map(id => questionQueue(state, id, busy)));
   }
+  function summaryHold(state) {
+    return (state?.turns || []).some(t => t.summary && (t.status === 'proposed' || t.status === 'preparing' || t.status === 'running'));
+  }
+  function paintFeedMeter() {
+    const count = snapshot?.state?.messages?.length || 0;
+    const raw = snapshot?.feedMax;
+    const limit = Number.isInteger(raw) && raw >= 1 ? raw : 1000;
+    const percent = count / limit * 100;
+    const box = $('feed-meter');
+    box.classList.toggle('high', percent >= 50 && percent < 80);
+    box.classList.toggle('hot', percent >= 80);
+    $('feed-meter-fill').style.width = Math.min(100, Math.max(0, percent)) + '%';
+    $('feed-meter-text').textContent = 'Сообщений: ' + count.toLocaleString('ru-RU');
+    box.setAttribute('aria-valuemin', '0');
+    box.setAttribute('aria-valuemax', '100');
+    box.setAttribute('aria-valuenow', String(Math.min(100, Math.max(0, Math.round(percent)))));
+    box.title = 'Сообщений в ленте: ' + count.toLocaleString('ru-RU') + ' из ' + limit.toLocaleString('ru-RU')
+      + '. Полоска заранее показывает, что отрисовка может начать тормозить. '
+      + 'На одном компьютере с вложениями (скрины и прочее) это было около 1050 сообщений, без вложений лента шла и после 1200. '
+      + 'Это ориентир для удобства, запись не блокируется. '
+      + 'Свой максимум меняется в настройках Trio: максимальное количество сообщений в ленте.';
+  }
   function render() {
     if (!snapshot) return;
+    paintFeedMeter();
     const {state, active, progress, permissions, compacting} = snapshot, busy = !!active || resetPending || !!compacting;
     const indexed = indexFeed(state);
     feedIndex = indexed;
@@ -838,7 +867,12 @@
       const group = indexed.byMessage.get(message.id) || [];
       const cancelled = !!message.cancelled || (message.author === 'Антон' && group.length > 0
         && !group.some(t => t.executor) && group.every(t => t.status === 'interrupted'));
-      row.className = 'message ' + (authors[message.author] || '') + (running ? ' active' : '')
+      // The summary task is stored as Anton's so it keeps a question number, but Trio wrote it.
+      const byButton = message.author === 'Антон' && group.some(t => t.summary);
+      const who = byButton ? summaryAuthor : message.author;
+      const name = row.querySelector('.message-head strong');
+      if (name.textContent !== who) name.textContent = who;
+      row.className = 'message ' + (authors[byButton ? 'Trio' : message.author] || '') + (running ? ' active' : '')
         + (message.error ? ' error' : '') + (message.control ? ' event' : '') + (cancelled ? ' cancelled' : '');
       const body = row.querySelector('.message-body');
       const bodyKey = message.text + '\0' + (message.detail || '') + '\0' + JSON.stringify(message.actions || [])
@@ -970,13 +1004,21 @@
     $('auto-edits').setAttribute('aria-pressed', String(editsOn));
     $('auto-commands').classList.toggle('selected', cmdsOn);
     $('auto-commands').setAttribute('aria-pressed', String(cmdsOn));
-    $('send').disabled = sendPending || attaching || resetPending;
-    $('attach').disabled = sendPending || attaching || resetPending;
-    const clearable = !busy && !sendPending && !attaching;
+    const privilegeOn = !!state.privilegeOn;
+    $('auto-privileges').classList.toggle('selected', privilegeOn);
+    $('auto-privileges').setAttribute('aria-pressed', String(privilegeOn));
+    if ($('privilege-dialog').open) paintPrivilegeReading();
+    const hold = summaryHold(state);
+    $('send').disabled = sendPending || attaching || resetPending || hold;
+    $('attach').disabled = sendPending || attaching || resetPending || hold;
+    const clearable = !busy && !sendPending && !attaching && !hold;
     $('reset-context').disabled = !clearable;
-    $('new-conversation').disabled = !clearable;
+    $('new-conversation').disabled = resetPending || sendPending || attaching || hold || !!compacting;
     $('compact-all').disabled = !clearable || !state.agents.some(a => a.enabled);
-    if (!clearable && confirmingNew) cancelConfirm();
+    if ($('fresh-dialog').open) {
+      paintFreshRemember();
+      $('fresh-go').disabled = !!compacting || hold || resetPending || !state.agents.some(a => a.enabled && a.id === freshProvider);
+    }
     $('draft').disabled = resetPending;
     $('send').textContent = active ? 'В очередь' : 'Отправить';
     $('popout').hidden = !!snapshot.detached;
@@ -1419,7 +1461,7 @@
   $('compact-all').onclick = () => post('compact', {}, error => {notice(error || 'Контекст сжат всем включённым участникам.', !!error);});
   $('composer').onsubmit = event => {
     event.preventDefault();
-    if (!initialized || sendPending || attaching || resetPending || !$('draft').value.trim() && !attachments.length) return;
+    if (!initialized || sendPending || attaching || resetPending || summaryHold(snapshot?.state) || !$('draft').value.trim() && !attachments.length) return;
     clearTimeout(draftTimer);
     const text = $('draft').value, order = [...responseOrder], sentAttachments = [...attachments];
     sendPending = true; render();
@@ -1498,29 +1540,63 @@
     });
   };
   $('archives').onclick = () => post('archives');
-  let confirmingNew = false, confirmTimer;
-  function cancelConfirm() {
-    clearTimeout(confirmTimer); confirmingNew = false;
-    $('new-conversation').textContent = 'Новый';
-    $('new-conversation').classList.remove('confirm');
+  let freshProvider = '';
+  function paintFreshRemember() {
+    const count = snapshot?.state?.messages?.length || 0;
+    $('fresh-count-value').textContent = count.toLocaleString('ru-RU');
+    $('fresh-remember').disabled = count < 1;
+  }
+  function openFresh() {
+    if (!initialized || resetPending || sendPending || attaching || snapshot?.compacting || summaryHold(snapshot?.state)) return;
+    const state = snapshot?.state;
+    if (!state) return;
+    const enabled = state.agents.filter(a => a.enabled);
+    if (!enabled.some(a => a.id === freshProvider)) freshProvider = enabled[0]?.id || '';
+    const box = $('fresh-agents');
+    box.replaceChildren(...enabled.map(a => {
+      const picked = a.id === freshProvider;
+      const b = button(names[a.id], () => {
+        freshProvider = a.id;
+        for (const child of box.children) {
+          const on = child.dataset.provider === a.id;
+          child.classList.toggle('selected', on);
+          child.setAttribute('aria-pressed', String(on));
+        }
+      });
+      b.dataset.provider = a.id;
+      b.setAttribute('aria-pressed', String(picked));
+      if (picked) b.classList.add('selected');
+      return b;
+    }));
+    box.style.gridTemplateColumns = 'repeat(' + Math.max(enabled.length, 1) + ', minmax(0, 1fr))';
+    if (!enabled.length) box.append(element('span', 'fresh-note', 'Включите участника.'));
+    paintFreshRemember();
+    $('fresh-go').disabled = !freshProvider;
+    if (!$('fresh-dialog').open) $('fresh-dialog').showModal();
   }
   function reset(mode) {
-    if (!initialized || resetPending || sendPending || attaching || snapshot?.active) return;
+    if (!initialized || resetPending || sendPending || attaching || snapshot?.active || summaryHold(snapshot?.state)) return;
     preserveDraft(); resetPending = true; render();
     post('reset', {mode}, error => {
       resetPending = false;
-      if (!error) notice(mode === 'context' ? 'Контекст сброшен.' : 'Новый разговор. Предыдущий сохранён в архиве.');
+      if (!error) notice('Контекст сброшен.');
       render();
     });
   }
   $('reset-context').onclick = () => reset('context');
-  // Clearing the feed is one click away, so it asks for a second one.
-  $('new-conversation').onclick = () => {
-    if (confirmingNew) {cancelConfirm(); reset('conversation'); return;}
-    confirmingNew = true;
-    $('new-conversation').textContent = 'Точно?';
-    $('new-conversation').classList.add('confirm');
-    confirmTimer = setTimeout(cancelConfirm, 5000);
+  $('new-conversation').onclick = openFresh;
+  $('fresh-cancel').onclick = () => $('fresh-dialog').close();
+  $('fresh-dialog').addEventListener?.('cancel', () => $('fresh-dialog').close());
+  $('fresh-remember').onclick = () => {
+    const count = snapshot?.state?.messages?.length || 0;
+    if (count < 1) return;
+    post('feed-max', {count});
+    $('fresh-dialog').close();
+  };
+  $('fresh-go').onclick = () => {
+    if (!freshProvider || $('fresh-go').disabled || snapshot?.compacting || summaryHold(snapshot?.state)) return;
+    post('fresh-summary', {provider: freshProvider});
+    $('fresh-dialog').close();
   };
   $('stop-all').onclick = () => post('stop');
   $('auto-reply').onclick = () => post('flags', {autoReply: !$('auto-reply').classList.contains('selected')});
@@ -1539,6 +1615,71 @@
     if (on) warnExecute();
     post('flags', {autoCommands: on});
   };
+  const privilegeIds = ['delete', 'network', 'git', 'shell', 'unparsed', 'other'];
+  const privilegeGenitive = {claude: 'Коляна', codex: 'Жеки', grok: 'Грихи'};
+  function privilegeNames(ids) {
+    const list = ids.map(id => privilegeGenitive[id]).filter(Boolean);
+    if (list.length < 2) return list[0] || '';
+    return list.slice(0, -1).join(', ') + ' и ' + list[list.length - 1];
+  }
+  function privilegeSentence(ids, queue) {
+    const who = privilegeNames(ids);
+    if (!who) return '';
+    const many = ids.length > 1;
+    if (queue) return 'В очереди у ' + who + ' режим Чтение — ' + (many ? 'они не смогут вносить правки в этих заданиях.' : 'он не сможет вносить правки в этом задании.');
+    return 'У ' + who + ' включено Чтение — ' + (many ? 'они не смогут вносить правки.' : 'он не сможет вносить правки.');
+  }
+  function paintPrivilegeReading() {
+    const state = snapshot?.state;
+    const line = $('privilege-reading');
+    if (!state) {line.hidden = true; line.textContent = ''; return;}
+    const enabled = state.agents.filter(a => a.enabled);
+    const card = enabled.filter(a => a.mode !== 'execute').map(a => a.id);
+    const queued = [];
+    for (const turnId of state.queue || []) {
+      const turn = state.turns.find(t => t.id === turnId && t.status === 'proposed' && t.mode === 'discuss');
+      if (!turn) continue;
+      const who = turn.recipient === 'all' ? enabled.map(a => a.id) : [turn.recipient];
+      for (const id of who) {
+        const agent = enabled.find(a => a.id === id);
+        if (agent && agent.mode === 'execute' && !queued.includes(id)) queued.push(id);
+      }
+    }
+    const text = [privilegeSentence(card, false), privilegeSentence(queued, true)].filter(Boolean).join(' ');
+    line.textContent = text;
+    line.hidden = !text;
+  }
+  $('auto-privileges').onclick = () => {
+    if ($('auto-privileges').classList.contains('selected')) {
+      post('flags', {privilegeOn: false});
+      return;
+    }
+    const picked = new Set(snapshot?.state?.privileges || []);
+    for (const id of privilegeIds) $('privilege-' + id).checked = picked.has(id);
+    paintPrivilegeReading();
+    if (!$('privilege-dialog').open) $('privilege-dialog').showModal();
+  };
+  $('privilege-all').onclick = () => {
+    for (const id of privilegeIds) $('privilege-' + id).checked = true;
+  };
+  $('privilege-ok').onclick = () => {
+    const privileges = privilegeIds.filter(id => $('privilege-' + id).checked);
+    $('privilege-dialog').close();
+    if (!privileges.length) return;
+    post('flags', {privilegeOn: true, privileges});
+  };
+  $('privilege-cancel').onclick = () => $('privilege-dialog').close();
+  let queueCopyTimer;
+  $('queue-copy').onclick = () => {
+    const text = [...$('queue-template').querySelectorAll('p')].map(p => p.textContent.trim()).join('\n\n');
+    post('copy', {text}, error => {
+      if (error) return;
+      $('queue-copy').textContent = 'Скопировано';
+      clearTimeout(queueCopyTimer);
+      queueCopyTimer = setTimeout(() => {$('queue-copy').textContent = 'Скопировать в буфер';}, 1500);
+    });
+  };
+  $('privilege-dialog').addEventListener?.('cancel', () => $('privilege-dialog').close());
   $('image-close').onclick = () => $('image-dialog').close?.();
   $('image-save').onclick = () => {const id = $('image-full').dataset.id; if (id) post('save-image', {id});};
   $('image-dialog').addEventListener?.('click', event => {if (event.target === $('image-dialog')) $('image-dialog').close?.();});

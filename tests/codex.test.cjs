@@ -35,6 +35,41 @@ test('Codex resumes with delta, separates turn spend from occupancy and refreshe
  assert.equal(wire.find(v=>v.method==='turn/start').params.input[0].text,'usage');
  assert.equal(extractCliVersion(f.reports.find(r=>r.source==='handshake').raw),'0.154.0-alpha.6.2');
 });
+test('Codex stores a new thread only after the first turn is accepted',native,async t=>{
+ let accepted=false;
+ const f=await fixture(t,'usage',{session:undefined,onSession:async id=>{
+  assert.equal(id,'thread-test');
+  const wire=await f.wire();
+  accepted=wire.some(v=>v.method==='turn/start')&&!wire.some(v=>v.method==='thread/resume');
+ }});
+ const result=await runProvider(f.o);
+ assert.equal(result.error,undefined);
+ assert.equal(accepted,true);
+});
+test('Codex resume still stores the session before the turn',native,async t=>{
+ let beforeTurn=false;
+ const f=await fixture(t,'usage',{onSession:async()=>{
+  const wire=await f.wire();
+  beforeTurn=wire.some(v=>v.method==='thread/resume')&&!wire.some(v=>v.method==='turn/start');
+ }});
+ assert.equal((await runProvider(f.o)).error,undefined);
+ assert.equal(beforeTurn,true);
+});
+test('Codex does not store a thread when the first turn is rejected',native,async t=>{
+ let called=false;
+ const f=await fixture(t,'start-fail',{session:undefined,onSession:async()=>{called=true;}});
+ const result=await runProvider(f.o);
+ assert.equal(called,false);
+ assert.match(result.error,/turn rejected/);
+});
+test('Codex missing rollout asks to reset context and keeps the failure out of the answer',native,async t=>{
+ let called=false;
+ const f=await fixture(t,'usage',{session:'missing',onSession:async()=>{called=true;}});
+ const result=await runProvider(f.o);
+ assert.equal(called,false);
+ assert.equal(result.error,'Сессия Жеки у Codex не найдена, сбросьте ему контекст.');
+ assert.match(result.stderr||'',/no rollout found/);
+});
 test('Codex questions keep ids and comma labels and continue the original turn',native,async t=>{
  const f=await fixture(t,'question',{question:async items=>{
    assert.deepEqual(items.map(q=>q.id),['a','b']);assert.equal(items[0].multi,true);

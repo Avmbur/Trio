@@ -49,6 +49,11 @@ export class SnapshotStorage {
   const records:{dir:string;at:number;bytes:number;active:boolean;m:Manifest}[]=[];
   for(const project of await this.directories(path.join(this.base,'projects'))){
    let refs:Set<string>|undefined,live=new Set<string>();
+   // A persisted save guard means refs may be stale. Protect this project's
+   // snapshots from both orphan cleanup and quota eviction until a save succeeds.
+   let refsPending = true;
+   try {await fs.access(path.join(project, 'snapshot-refs.pending'));}
+   catch(e) {if ((e as NodeJS.ErrnoException).code === 'ENOENT') refsPending = false;}
    try{
     const pin=JSON.parse(await fs.readFile(path.join(project,'snapshot-refs.json'),'utf8'));
     if(Array.isArray(pin?.snapshots))refs=new Set(pin.snapshots.filter((v:any)=>typeof v==='string').map((v:string)=>path.resolve(v)));
@@ -56,8 +61,8 @@ export class SnapshotStorage {
    }catch{}
    // Missing refs are not evidence that a snapshot is orphaned.
    for(const dir of await this.directories(path.join(project,'snapshots'))){
-    let active=false;
-    try{const pin=JSON.parse(await fs.readFile(path.join(dir,'active.json'),'utf8'));active=Number.isInteger(pin.pid)&&pin.pid>0&&alive(pin.pid);}catch{}
+    let active=refsPending;
+    try{const pin=JSON.parse(await fs.readFile(path.join(dir,'active.json'),'utf8'));active ||= Number.isInteger(pin.pid)&&pin.pid>0&&alive(pin.pid);}catch{}
     let ownerAlive=false;try{const owner=JSON.parse(await fs.readFile(path.join(this.base,'owners',path.basename(project)+'.lock'),'utf8'));ownerAlive=Number.isInteger(owner.pid)&&owner.pid>0&&alive(owner.pid);}catch{}
     if(!active&&ownerAlive&&live.has(path.resolve(dir)))active=true;
     let m:Manifest;

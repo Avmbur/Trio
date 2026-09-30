@@ -1,6 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { State, Catalogs, fresh, input, providers, id, validAttachments, normalizeInstruction } from '../shared/model';
+import { State, Catalogs, fresh, input, providers, id, validAttachments, normalizeInstruction, summaryFeed, summaryFile, privilegeIds } from '../shared/model';
 
 export function shortError(e: unknown): string {
  const raw = String(e);
@@ -106,10 +106,13 @@ export class Store {
   s.autoReply = s.autoReply === true;
   s.autoEdits = s.autoEdits === true || s.autoActions === true;
   s.autoCommands = s.autoCommands === true;
+  s.privileges = privilegeIds.filter(id => Array.isArray(s.privileges) && s.privileges.includes(id));
+  s.privilegeOn = s.privilegeOn === true && s.privileges.length > 0;
   for (const t of s.turns) {
     if (typeof t.startedAt !== 'number' || !Number.isFinite(t.startedAt)) delete t.startedAt;
     if (typeof t.endedAt !== 'number' || !Number.isFinite(t.endedAt)) delete t.endedAt;
     if (typeof t.cycle !== 'number' || !Number.isFinite(t.cycle) || t.cycle < 1) delete t.cycle;
+    if (t.summary !== true) delete t.summary;
     const instruction = normalizeInstruction(t.instruction);
     if (instruction) t.instruction = instruction;
     else delete t.instruction;
@@ -135,6 +138,20 @@ export class Store {
  async saveCatalogs(catalogs:Catalogs):Promise<void> {
   await writeAtomic(path.join(this.dir,'catalogs.json'), JSON.stringify(catalogs,null,2));
  }
+ // The summarizer reads the feed from the project root: every engine can read there in Чтение.
+ // It lives only for the summary turn; the archive keeps the full state anyway.
+ async summarySource(state: State, root: string, git = ''): Promise<string> {
+  const file = path.join(root, summaryFile);
+  await writeAtomic(file, summaryFeed(state, git));
+  return file;
+ }
+ async dropSummarySource(root: string): Promise<void> {
+  const file = path.join(root, summaryFile);
+  // Try both paths even if one is locked; never remove directories or use a glob.
+  const results = await Promise.allSettled([file, file + '.tmp'].map(target => fs.rm(target, {force: true})));
+  const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (failed) throw failed.reason;
+ }
  async archive(state:State):Promise<string> {
   await this.pending;
   const dir=path.join(this.dir,'archives'); await fs.mkdir(dir,{recursive:true});
@@ -152,14 +169,32 @@ export class Store {
   const refs = JSON.stringify({pid: process.pid, snapshots: snapshotPaths(state), active: activeSnapshots(state)});
   const job=this.pending.then(async()=>{
    await fs.mkdir(this.dir,{recursive:true});
+   // Persist the guard before changing state. Failed refs must never make new
+   // snapshots look orphaned, even to another window or after a restart.
+   const refsPending = path.join(this.dir, 'snapshot-refs.pending');
+   await fs.writeFile(refsPending, '', 'utf8');
    await writeAtomic(path.join(this.dir,'messages.jsonl'), feed);
    const target=path.join(this.dir,'state.json'); const temp=target+'.tmp';
    const h=await fs.open(temp,'w'); try {await h.writeFile(data,'utf8');await h.sync();} finally {await h.close();}
    try {await fs.copyFile(target,target+'.bak');} catch(e) {if ((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
    await replace(temp,target);
-   await writeAtomic(path.join(this.dir,'snapshot-refs.json'), refs);
+   // Refs only tell cleanup which snapshots to keep. state.json is already stored.
+   // A lock on this file must not fail the turn; the next save writes the refs.
+   try {
+    await writeAtomic(path.join(this.dir,'snapshot-refs.json'), refs);
+    await fs.rm(refsPending, {force: true});
+   }
+   catch(e) {
+    if(!lockedFile(e))throw e;
+    state.diagnostics.push('snapshot-refs: '+String(e));
+    state.diagnostics=state.diagnostics.slice(-100);
+   }
   }); this.pending=job.catch(()=>{}); return job;
  }
+}
+function lockedFile(e:unknown):boolean {
+ const code=(e as NodeJS.ErrnoException).code;
+ return code==='EPERM'||code==='EACCES'||code==='EBUSY';
 }
 // Windows refuses to rename over a file someone holds open: another Trio window's snapshot
 // cleanup reading state.json, antivirus, the indexer. Such a lock is momentary, so wait it out.
@@ -168,8 +203,7 @@ export async function replace(temp:string,target:string,deadline=2000):Promise<v
  for(let pause=20;;pause=Math.min(pause*2,200)){
   try {return await fs.rename(temp,target);}
   catch(e) {
-   const code=(e as NodeJS.ErrnoException).code;
-   if(!['EPERM','EACCES','EBUSY'].includes(code!)||Date.now()>=until)throw e;
+   if(!lockedFile(e)||Date.now()>=until)throw e;
    await new Promise(r=>setTimeout(r,pause));
   }
  }
