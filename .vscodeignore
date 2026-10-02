@@ -6,6 +6,7 @@ old/**
 .git/**
 .gitignore
 .gitattributes
+.trio-privileges.jsonl
 docs/**
 *.vsix
 tsconfig.json

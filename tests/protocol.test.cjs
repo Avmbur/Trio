@@ -46,3 +46,35 @@ test('Grok discuss mode denies every tool request without asking Anton',{timeout
   permission:async()=>{asked++;return true;}});
  assert.equal(asked,0);assert.equal(result.text,'Начало\n\nотказ');assert.equal(result.error,undefined);
 });
+test('Grok cancelled after a silent refusal is not an empty answer or a user stop',{timeout:20000,skip:process.platform!=='win32'},async t=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'trio-grok-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ await fs.copyFile(path.join(__dirname,'fake-engine.cjs'),path.join(root,'fake.cjs'));
+ const cli=path.join(root,'fake.cmd');await fs.writeFile(cli,'@node "%dp0%/fake.cjs" %*');
+ let asked=0;
+ const result=await runProvider({provider:'grok',cli,root,execute:false,prompt:'ENGINE_CANCEL',model:'grok-4.6',effort:'xhigh',
+  jobRunner:path.resolve('dist/native/JobRunner.exe'),timeout:15000,signal:new AbortController().signal,
+  onPid:async()=>{},onSession:async()=>{},text:()=>{},progress:()=>{},
+  permission:async()=>{asked++;return true;}});
+ assert.equal(asked,0);
+ assert.match(result.text,/Начало/);
+ assert.equal(result.cancelled,true);
+ assert.equal(result.refused,true);
+ assert.equal(result.interrupted,false);
+ assert.equal(result.error,undefined);
+});
+test('Grok cancelled without a permission request is not an empty answer',{timeout:20000,skip:process.platform!=='win32'},async t=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'trio-grok-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ await fs.copyFile(path.join(__dirname,'fake-engine.cjs'),path.join(root,'fake.cjs'));
+ const cli=path.join(root,'fake.cmd');await fs.writeFile(cli,'@node "%dp0%/fake.cjs" %*');
+ let asked=0;
+ const result=await runProvider({provider:'grok',cli,root,execute:true,prompt:'ENGINE_CANCEL_BARE',model:'grok-4.6',effort:'xhigh',
+  jobRunner:path.resolve('dist/native/JobRunner.exe'),timeout:15000,signal:new AbortController().signal,
+  onPid:async()=>{},onSession:async()=>{},text:()=>{},progress:()=>{},
+  permission:async()=>{asked++;return true;}});
+ assert.equal(asked,0);
+ assert.equal(result.text,'');
+ assert.equal(result.cancelled,true);
+ assert.equal(result.refused,undefined);
+ assert.equal(result.interrupted,false);
+ assert.equal(result.error,undefined);
+});

@@ -25,8 +25,8 @@
     if (!Array.isArray(value)) return [];
     const order = [];
     for (const item of value)
-      if (providers.includes(item) && !order.includes(item)) order.push(item);
-    return order.slice(0, 3);
+      if (providers.includes(item)) order.push(item);
+    return order.slice(0, 10);
   }
   function normalizeFlags(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;

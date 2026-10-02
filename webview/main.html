@@ -37,7 +37,7 @@
     </header>
     <div id="connection" class="connection" role="status">Подключение к Trio…</div>
     <div id="layout" class="layout">
-      <section class="chat-pane" aria-label="Разговор">
+      <section id="chat-pane" class="chat-pane" aria-label="Разговор">
         <div id="search-box" class="search-box" hidden>
           <label class="sr-only" for="search">Найти в переписке</label><input id="search" type="search" placeholder="Найти в переписке или сообщение по номеру #1, #25, #К76 и т.п.">
           <span id="search-count" aria-live="polite"></span>
@@ -47,13 +47,17 @@
         </div>
         <main id="feed" class="feed" aria-label="Переписка" tabindex="0"></main>
         <button id="latest" class="latest" hidden>↓ Последнее</button>
+        <div id="composer-divider" class="composer-divider" role="separator" tabindex="0" aria-label="Высота поля ввода" aria-orientation="horizontal" aria-valuemin="64" aria-valuemax="4000" aria-valuenow="88" title="Потяни вверх или вниз. Двойной щелчок вернёт обычную высоту."></div>
         <form id="composer" class="composer">
           <p class="composer-hint">Shift+Enter — новая строка · Enter — отправить</p>
           <label class="sr-only" for="draft">Сообщение</label>
           <textarea id="draft" rows="3" placeholder="Сообщение…" disabled></textarea>
           <div id="attachments" class="attachments"></div>
+          <div id="order-strip" class="order-strip" hidden></div>
+          <p id="pass-hint" class="pause-hint" hidden></p>
+          <p id="pause-hint" class="pause-hint" hidden>Пауза. Вопрос снимет паузу. Уже начатый вопрос он не разрывает: сначала доходят его оставшиеся шаги, потом этот вопрос, потом остальная очередь. Ответы на него увидят следующие агенты сценария — это может разойтись с ним.</p>
           <div class="recipients-row"><span>Отвечают:</span><div id="response-order" role="group" aria-label="Кому и в каком порядке отвечать"></div>
-            <button id="auto-reply" type="button" aria-pressed="false" title="Следующие вопросы тоже пойдут сами, пока флаг включён. Ошибка, лимит или Стоп одному — слово тебе. Стоп всем гасит флаг.">Автоответ</button>
+            <button id="auto-reply" type="button" aria-pressed="false" title="Следующие вопросы тоже пойдут сами, пока флаг включён. Внутри цепочки после ошибки или лимита идёт следующий. Стоп одному возвращает слово тебе. Стоп всем гасит флаг.">Автоответ</button>
             <button id="auto-edits" type="button" aria-pressed="false" title="Чтение и запись файлов без окна. Нужен режим Правок. Удаление, сеть и команды всё равно спросят.">+правки</button>
             <button id="auto-commands" type="button" aria-pressed="false" title="Тесты, tsc, сборка, обычный Bash без окна. Git-коммит, push, удаление и сеть спросят. Нужны Правки.">+команды</button>
             <button id="auto-privileges" type="button" aria-pressed="false" title="Опасные действия без окна, для очереди. Первое нажатие открывает выбор, повторное выключает.">+привилегии</button>
@@ -74,7 +78,7 @@
                 <div id="snippets-list" role="listbox" aria-label="Заготовки"></div>
               </div>
             </div>
-            <button id="discuss" type="button" aria-pressed="false" title="Этот вопрос — только обсуждение, даже если в карточке включены Правки. В конец допишется «обсуждаем, код не трогать».">Обсуждаем</button>
+            <button id="discuss" type="button" aria-pressed="false" title="Этот вопрос — только обсуждение, даже если в карточке включены Правки. К тексту допишется «обсуждаем, код не трогать».">Обсуждаем</button>
             <button id="send" type="submit" class="primary" disabled>Отправить</button>
           </div>
           <p id="delta-hint" class="delta-hint" hidden></p>
@@ -82,25 +86,29 @@
       </section>
       <div id="panel-divider" class="panel-divider" role="separator" tabindex="0" aria-label="Ширина панели управления" aria-orientation="vertical" aria-valuemin="380" aria-valuemax="600" aria-valuenow="400"></div>
       <aside id="controls-pane" class="controls-pane" aria-label="Управление">
-        <section class="control-block"><div id="agents" class="agents"></div></section>
-        <section class="control-block">
-          <section class="block-part">
-            <div class="work-head">
-              <h2>Работа:</h2>
+        <div class="controls-fill">
+        <section id="agents-block" class="control-block fold-block">
+          <h2><button id="agents-fold" class="fold-head" type="button" aria-expanded="true" aria-controls="agents" title="Свернуть карточки агентов. Очередь займёт освободившуюся высоту.">Агенты</button></h2>
+          <div id="agents" class="agents"></div>
+        </section>
+        <section id="queue-block" class="control-block queue-block fold-block">
+          <h2><button id="queue-fold" class="fold-head" type="button" aria-expanded="true" title="Свернуть агентов. Очередь займёт освободившуюся высоту.">Очередь</button></h2>
+          <div id="queue-body" class="queue-body">
+            <div class="work-buttons">
+              <button id="pause" type="button" aria-pressed="false" disabled title="Пауза: текущий агент спокойно закончит ход, следующий из очереди не начнёт. Пауза хранится на диске и переживёт закрытие VS Code. Во время паузы можно отправить вопрос вне очереди. Учти, что это может сбить с толку заготовленную очередь, которая пойдёт после незапланированного вопроса.">Пауза</button>
               <button id="auto-reply-work" type="button" aria-pressed="false" title="Следующие вопросы тоже пойдут сами. Стоп одному останавливает цепочку, Стоп всем гасит флаг.">Авто</button>
-              <button id="stop-all" type="button" disabled title="Остановить работающего и выключить автоответ">■ Стоп всем</button>
+              <button id="stop-all" type="button" disabled title="Остановить работающего сразу, посреди хода, и выключить автоответ. Чтобы дать агенту закончить, жми «Пауза».">■ Стоп всем</button>
             </div>
             <div class="floor"><span id="floor-dot" class="floor-dot"></span><strong id="floor-title">Подключение…</strong></div>
             <div id="floor-detail"></div>
-          </section>
-          <section class="block-part queue-part">
-            <h2 class="plain">Очередь ответов</h2>
-            <div class="queue-slot">
+            <div id="queue-list" class="queue-list" aria-label="Вопросы в очереди">
               <p id="queue-empty" class="empty">Нет ожидающих ответов.</p>
               <div id="queued" class="queued" hidden></div>
             </div>
-            <details id="older-queue" class="older-queue" hidden><summary id="older-summary">Другие ожидающие вопросы</summary><div id="older-rows"></div></details>
-          </section>
+          </div>
+        </section>
+        </div>
+        <section class="control-block">
           <section class="block-part">
             <h2 class="plain">Параметры разговора</h2>
             <div class="conversation-actions">
@@ -111,7 +119,9 @@
             </div>
           </section>
         </section>
-        <div id="notice" class="notice" role="status" aria-live="polite" hidden><div id="notice-text" class="notice-text" title="Показать целиком"></div><button id="notice-close" class="notice-close" type="button" title="Закрыть" aria-label="Закрыть">×</button></div>
+        <div class="notice-slot">
+          <div id="notice" class="notice" role="status" aria-live="polite" hidden><div id="notice-text" class="notice-text" title="Показать целиком"></div><button id="notice-close" class="notice-close" type="button" title="Закрыть" aria-label="Закрыть">×</button></div>
+        </div>
       </aside>
     </div>
     <dialog id="creator-dialog" aria-labelledby="creator-title">
@@ -192,17 +202,7 @@
     <dialog id="privilege-dialog" aria-labelledby="privilege-title">
       <h2 id="privilege-title">Привилегии</h2>
       <div class="privilege-grid">
-        <section class="privilege-block privilege-fit" aria-labelledby="queue-how-title">
-          <h3 id="queue-how-title">Как сделать очередь</h3>
-          <div class="privilege-body">
-          <ol class="queue-steps">
-            <li>Собери план всей очереди: задания, порядок, исполнители и ожидаемый результат.</li>
-            <li>Первый цикл — только уточнения. Скопируй текст ниже, вставь в поле ввода и допиши после него свой план очереди.</li>
-            <li>Ответь на вопросы агентов в их окнах: выбирай предложенный вариант или вписывай свой.</li>
-            <li>Проверь режим «Правки» у нужных участников, отметь привилегии справа и запускай очередь.</li>
-          </ol>
-          </div>
-        </section>
+        <div class="privilege-column">
         <section class="privilege-block" aria-labelledby="privilege-about-title">
           <h3 id="privilege-about-title">Режим очереди</h3>
           <div class="privilege-body">
@@ -213,20 +213,20 @@
           <p id="privilege-reading" class="privilege-reading" hidden></p>
           </div>
         </section>
-        <section class="privilege-block" aria-labelledby="queue-text-title">
-          <h3 id="queue-text-title">Текст первого цикла</h3>
-          <div id="queue-template" class="queue-template privilege-body">
-            <p>Это будет автоматическая работа всех троих или назначенных участников. Следующие сообщения из очереди будут поступать после того, как участники ответят на предыдущее или выполнят задание.</p>
-            <p>Сейчас первый цикл — только уточнения, без изменений кода. Ниже план всей очереди. Изучи его и задай сейчас вопросы, которые могут помешать выполнению без моего участия.</p>
-            <p>Каждый — до 20 необходимых вопросов, можно меньше. Учитывай вопросы и ответы предыдущих участников: не повторяй уже заданное, сокращай свой список. Задавай вопросы через модальные окна, чтобы я мог выбирать ответы, а при необходимости вводить свой. Если предлагаешь варианты, отметь рекомендуемый и кратко объясни почему. Если вопросов нет, напиши «Вопросов нет».</p>
-            <p>Я отвечу перед запуском второго цикла. Во втором цикле начнётся реализация уже без моего участия.</p>
-          </div>
-          <div class="privilege-actions">
-            <button id="queue-copy" type="button">Скопировать в буфер</button>
+        <section class="privilege-block" aria-labelledby="queue-how-title">
+          <h3 id="queue-how-title">Как сделать очередь</h3>
+          <div class="privilege-body">
+          <ol class="privilege-steps">
+            <li>Собери план всей очереди: задания, порядок, исполнители и ожидаемый результат.</li>
+            <li>Первый цикл — только уточнения. Скопируй текст справа, вставь в поле ввода и допиши после него свой план очереди.</li>
+            <li>Ответь на вопросы агентов в их окнах: выбирай предложенный вариант или вписывай свой.</li>
+            <li>Проверь режим «Правки» у нужных участников, отметь «Разрешить действия» ниже и запускай очередь.</li>
+            <li>Если в цикле несколько проходов, задание каждого начинай отдельной строкой [Проход N из M: Имя], даже если агент один. Имена и «из M» Trio подставляет с плашек сам. Иначе в первый проход агент сделает и то, что оставлено на его следующий отдельный проход в этом цикле.</li>
+          </ol>
           </div>
         </section>
         <section class="privilege-block" aria-labelledby="privilege-boxes-title">
-          <h3 id="privilege-boxes-title">Без окна разрешения</h3>
+          <h3 id="privilege-boxes-title">Разрешить действия:</h3>
           <div id="privilege-boxes" class="privilege-body">
             <label class="privilege-box"><input id="privilege-delete" type="checkbox"> <span>Удаление. Удаление файлов без окна.</span></label>
             <label class="privilege-box"><input id="privilege-network" type="checkbox"> <span>Сеть. Поиск, загрузка страниц, curl и wget без окна.</span></label>
@@ -241,6 +241,26 @@
             <button id="privilege-cancel" type="button">Отмена</button>
           </div>
         </section>
+        </div>
+        <div class="privilege-column">
+        <section class="privilege-block" aria-labelledby="queue-text-title">
+          <h3 id="queue-text-title">Текст первого цикла</h3>
+          <div id="queue-template" class="queue-template privilege-body">
+            <p>Это будет автоматическая работа всех троих (Колян, Жека, Гриха) или назначенных участников по циклам.</p>
+            <p><strong>**Цикл — одно моё сообщение в ленте с заданиями и поочерёдные автоматические ответы всех назначенных в нём участников. Когда ответили все назначенные, цикл завершён и из очереди приходит следующее моё сообщение. Если цикл прерван до последнего ответа, он не завершён.**</strong></p>
+            <p><strong>**Один участник может стоять в цепочке несколько раз. Каждое его место в цепочке — отдельный проход. Задание прохода начинается отдельной строкой в квадратных скобках, например [Проход 1 из 3: Гриха]. Когда дойдёт твой проход, Trio перед моим сообщением напишет его номер, например «Твой проход — 1 из 3». Выполни задание под меткой своего прохода, следующие не трогай.**</strong></p>
+            <p><strong>**Если предлагаешь очередь или правки к ней, давай для каждого цикла один готовый текст для отправки в ленту. Задание каждого участника начинай отдельной строкой [Проход N из M: Имя] в порядке ответов, даже если участник в цикле один. По этим строкам Trio сам выставит, кто и в каком порядке отвечает.**</strong></p>
+            <p>Сейчас первый цикл — только уточнения, без изменений кода. Ниже план всей очереди. Изучи его и задай сейчас вопросы, которые могут помешать выполнению без моего участия.</p>
+            <p>Каждый участник — до 20 необходимых вопросов, можно меньше. Учитывай вопросы и ответы предыдущих участников: не повторяй уже заданное, сокращай свой список. Задавай вопросы через модальные окна, чтобы я мог выбирать ответы, а при необходимости вводить свой. Если предлагаешь варианты, отметь рекомендуемый и кратко объясни почему. Если вопросов нет, напиши «Вопросов нет».</p>
+            <p>Все необходимые ответы я дам перед запуском второго цикла. Во втором цикле начнётся реализация уже без моего участия.</p>
+            <p>План очереди:</p>
+            <p>(вставить свой текст)</p>
+          </div>
+          <div class="privilege-actions">
+            <button id="queue-copy" type="button">Скопировать в буфер</button>
+          </div>
+        </section>
+        </div>
       </div>
     </dialog>
     <dialog id="fresh-dialog" aria-labelledby="fresh-title">
@@ -248,6 +268,7 @@
       <ol class="fresh-warn">
         <li>Не стоит начинать новый разговор агентом с полным контекстным окном, потому что оно может начать сжиматься в самый неподходящий момент.</li>
         <li>Не стоит этого делать на пределе лимита подписки.</li>
+        <li id="fresh-queue" hidden>В очереди есть вопросы. После сводки они уйдут в архив вместе с лентой и сами не продолжатся.</li>
       </ol>
       <div id="fresh-agents" role="group" aria-label="Кто готовит сводку"></div>
       <div class="fresh-column">

@@ -24,6 +24,155 @@ export function agentPromptPrefix(agent: Agent, mode: Mode): string {
   if (instruction) lines.push(instruction);
   return lines.join('\n');
 }
+// "Твой проход — 1 из 3. Выполни задание этого прохода, учитывая общие указания сообщения."
+// The place is frozen at send. The total is the greater of the chips and the marks in
+// the text, so a spare [Проход 3 из 3: ?] is not told as «из 2». Square brackets are
+// not used here. They belong only to draft marks, see passMarks.
+export function passLine(turn: Turn, turns: Turn[], text = ''): string {
+  if (!turn.pass) return '';
+  const siblings = turns.filter(t => t.messageId === turn.messageId && t.pass);
+  const marked = passMarks(text);
+  const total = Math.max(passSpan(marked, siblings.length), siblings.reduce((max, item) => Math.max(max, item.pass || 0), 0));
+  if (total < 2) return '';
+  return 'Твой проход — ' + turn.pass + ' из ' + total
+    + '. Выполни задание этого прохода, учитывая общие указания сообщения.';
+}
+// A pass mark is a whole line: [Проход N из M: Имя], N and M from 1 to 10,
+// names Колян, Жека, Гриха. Trio itself writes ? when a mark has no assignee.
+export interface PassMark {pass: number; total: number; name: string; line: number}
+const passMarkRe = /^\[Проход ([1-9]|10) из ([1-9]|10): (Колян|Жека|Гриха|\?)\]$/;
+const markProvider: Record<string, Provider> = {Колян: 'claude', Жека: 'codex', Гриха: 'grok'};
+export function passMarks(text: string): PassMark[] {
+  const marks: PassMark[] = [];
+  String(text ?? '').split('\n').forEach((raw, line) => {
+    const match = raw.replace(/\r$/, '').match(passMarkRe);
+    if (match) marks.push({pass: Number(match[1]), total: Number(match[2]), name: match[3], line});
+  });
+  return marks;
+}
+// M is the greater of how many marks there are, how many chips there are, and the
+// highest pass number written in a mark.
+export function passSpan(marks: readonly PassMark[], chips: number): number {
+  const highest = marks.reduce((max, mark) => Math.max(max, mark.pass), 0);
+  return Math.max(marks.length, chips, highest);
+}
+// Chip N is pass N. A ? or a missing number does not pull the next name forward:
+// only the uninterrupted run from pass 1 becomes chips.
+export function providersFromMarks(text: string): Provider[] {
+  const slots: (Provider | undefined)[] = [];
+  for (const mark of passMarks(text)) {
+    const provider = markProvider[mark.name];
+    if (provider) slots[mark.pass - 1] = provider;
+  }
+  const order: Provider[] = [];
+  for (const provider of slots) {
+    if (!provider) break;
+    order.push(provider);
+  }
+  return order;
+}
+function passWho(order: readonly Provider[], pass: number): string {
+  const provider = order[pass - 1];
+  return provider ? names[provider] : '?';
+}
+function passMarkLine(pass: number, total: number, who: string): string {
+  return '[Проход ' + pass + ' из ' + total + ': ' + who + ']';
+}
+function rewritePassLines(text: string, order: readonly Provider[]): string {
+  const marks = passMarks(text);
+  if (!marks.length) return text;
+  const total = Math.max(passSpan(marks, order.length), 1);
+  return String(text).split('\n').map(raw => {
+    const cr = raw.endsWith('\r');
+    const line = cr ? raw.slice(0, -1) : raw;
+    const match = line.match(passMarkRe);
+    if (!match) return raw;
+    const next = passMarkLine(Number(match[1]), total, passWho(order, Number(match[1])));
+    return cr ? next + '\r' : next;
+  }).join('\n');
+}
+function appendPassMarks(text: string, order: readonly Provider[], from: number, to: number): string {
+  const blocks = [];
+  for (let pass = from; pass <= to; pass++) blocks.push(passMarkLine(pass, Math.max(order.length, to), passWho(order, pass)));
+  const skeleton = blocks.join('\n\n') + '\n';
+  const base = String(text ?? '').replace(/[ \t]+$/g, '').replace(/\n+$/g, '');
+  return base ? base + '\n\n' + skeleton : skeleton;
+}
+function passRegions(text: string): {lines: string[]; marks: {pass: number; line: number}[]} {
+  const lines = String(text ?? '').split('\n');
+  const marks: {pass: number; line: number}[] = [];
+  lines.forEach((raw, line) => {
+    const match = raw.replace(/\r$/, '').match(passMarkRe);
+    if (match) marks.push({pass: Number(match[1]), line});
+  });
+  return {lines, marks};
+}
+function regionEmpty(lines: string[], start: number, end: number): boolean {
+  for (let i = start; i < end; i++) if (lines[i].replace(/\r$/, '').trim()) return false;
+  return true;
+}
+function stripTrailingEmptyMark(text: string, chips: number): string {
+  let current = text;
+  while (true) {
+    const {lines, marks} = passRegions(current);
+    const last = marks[marks.length - 1];
+    if (!last || last.pass <= chips || !regionEmpty(lines, last.line + 1, lines.length)) break;
+    current = lines.slice(0, last.line).join('\n');
+  }
+  return current;
+}
+function markBodiesEmpty(text: string): boolean {
+  const {lines, marks} = passRegions(text);
+  if (!marks.length) return false;
+  return marks.every((mark, index) => regionEmpty(lines, mark.line + 1, index + 1 < marks.length ? marks[index + 1].line : lines.length));
+}
+function removePassMarks(text: string): string {
+  const {lines, marks} = passRegions(text);
+  if (!marks.length) return text;
+  return lines.slice(0, marks[0].line).join('\n').replace(/\n+$/g, '');
+}
+// Chip actions write marks. 'add' appends from the highest pass number through the
+// chip count. A missing number in the middle stays missing and does not add a mark
+// past the chips. 'drop' removes an empty tail that no longer has a chip, and a lone
+// chip with only empty marks goes back to plain text. 'names' and 'clear' rewrite
+// names and «из M» and leave the lines.
+export function syncPassMarks(text: string, order: readonly Provider[], kind: 'add' | 'names' | 'drop' | 'clear' = 'names'): string {
+  let body = String(text ?? '');
+  const marks = passMarks(body);
+  if (kind === 'add' && order.length >= 2 && !marks.length) body = appendPassMarks(body, order, 1, order.length);
+  else if (kind === 'add' && marks.length) {
+    const start = marks.reduce((max, mark) => Math.max(max, mark.pass), 0) + 1;
+    if (start <= order.length) body = appendPassMarks(body, order, start, order.length);
+  }
+  if (!passMarks(body).length) return body;
+  body = rewritePassLines(body, order);
+  if (kind === 'drop' && order.length) {
+    body = stripTrailingEmptyMark(body, order.length);
+    if (passMarks(body).length) body = rewritePassLines(body, order);
+    if (order.length < 2 && markBodiesEmpty(body)) body = removePassMarks(body);
+  }
+  return body;
+}
+// The name comes from chip N, N being the number written in the mark, not the mark's
+// place in the text. The number and every other line stay. No chip N means ?.
+export function rewritePassNames(text: string, order: readonly Provider[]): string {
+  return syncPassMarks(text, order, 'names');
+}
+const discussNote = 'обсуждаем, код не трогать';
+// With pass marks the note belongs to the shared part, above the first mark.
+// Only that shared part can suppress it. The same words inside one pass do not.
+// Without marks the note stays at the end of the message.
+export function placeDiscussLine(text: string): string {
+  const body = String(text ?? '');
+  if (!body.trim()) return body;
+  const marks = passMarks(body);
+  const lines = body.split('\n');
+  const head = (marks.length ? lines.slice(0, marks[0].line).join('\n') : body).replace(/\s+$/u, '');
+  if (/обсуждаем|код не трогать/iu.test(head)) return body;
+  if (!marks.length) return head + '\n\n' + discussNote;
+  const tail = lines.slice(marks[0].line).join('\n').replace(/^\n+/u, '');
+  return (head ? head + '\n\n' : '') + discussNote + '\n\n' + tail;
+}
 // Filled from each engine's own handshake, never hard-coded.
 export interface ModelChoice {value: string; label: string; description?: string; efforts: string[]}
 export type Catalogs = Partial<Record<Provider, ModelChoice[]>>;
@@ -39,8 +188,8 @@ function snippetName(value: unknown): string {
 function snippetOrder(value: unknown): Provider[] {
   if (!Array.isArray(value)) return [];
   const order: Provider[] = [];
-  for (const item of value) if (isProvider(item) && !order.includes(item)) order.push(item);
-  return order.slice(0, 3);
+  for (const item of value) if (isProvider(item)) order.push(item);
+  return order.slice(0, 10);
 }
 function snippetFlags(raw: unknown): SnippetFlags | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
@@ -104,6 +253,9 @@ export interface Message {
   turn?: string; error?: boolean; partial?: boolean; control?: boolean; cancelled?: boolean;
   detail?: string; actions?: {title: string; detail?: string}[]; attachments?: Attachment[];
   question?: UserQuestion;
+  // Обсуждаем on this post. False is a later send without the button.
+  // Missing means a post from before the flag, and the click still guesses.
+  discuss?: boolean;
 }
 export interface TraceStep {id: string; kind: 'tool' | 'thought'; title: string; status: 'running' | 'done'}
 export interface Turn {
@@ -113,6 +265,8 @@ export interface Turn {
   spent?: number; spentHint?: string;
   trace?: TraceStep[];
   cycle?: number;
+  // Place in the message's chain, from 1. A retry keeps the place of the turn it repeats.
+  pass?: number;
   instruction?: string;
   // A feed handoff: one discuss turn whose finished text replaces the conversation.
   summary?: boolean;
@@ -128,9 +282,18 @@ export interface State {
   imports: string[]; diagnostics: string[];
   autoReply?: boolean; autoEdits?: boolean; autoCommands?: boolean; autoActions?: boolean;
   privilegeOn?: boolean; privileges?: Privilege[];
+  // Пауза очереди: текущий ход доходит до конца, следующий не начинается. Живёт на диске.
+  paused?: boolean;
 }
 // In the project root for the summary turn only; .gitignore lists it.
 export const summaryFile = '.trio-summary.md';
+// Catch-all privilege hits, one JSON object per line. .gitignore lists it.
+export const privilegeJournalFile = '.trio-privileges.jsonl';
+// reason is a fixed label and never contains the command or its arguments.
+export interface PrivilegeJournalRow {
+  at: string; agent: string; word: string; privilege: 'unparsed' | 'other';
+  reason: string; outcome: 'само' | 'разрешено' | 'отказ';
+}
 export const summaryComfort = 'Можно комфортно продолжать работу дальше';
 export const summaryPrompt = [
   'Trio по кнопке «Новый»: сводка для нового разговора.',
@@ -152,7 +315,7 @@ export const fresh = (): State => ({
   conversationId: id(), responseOrder: [], version: 3, messages: [], turns: [], tasks: [], queue: [], draftAttachments: [], draft: '', recipient: 'all',
   agents: providers.map(p => ({id: p, enabled: p !== 'grok', mode: 'discuss', model: '', effort: ''})),
   sessions: {}, usage: {}, imports: [], diagnostics: [], autoReply: false, autoEdits: false, autoCommands: false,
-  privilegeOn: false, privileges: []
+  privilegeOn: false, privileges: [], paused: false
 });
 export const imageExtensions: Record<string, string> = {
   'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp', 'image/bmp': '.bmp'
@@ -185,6 +348,7 @@ export type Privilege = typeof privilegeIds[number];
 const networkBins = new Set(['curl', 'wget', 'invokewebrequest']);
 const shellBins = new Set(['rm', 'rd', 'del', 'rmdir', 'removeitem']);
 const dangerGit = new Set(['commit', 'push', 'reset', 'rebase', 'amend']);
+const wrapperBins = new Set(['powershell', 'pwsh', 'bash', 'sh', 'zsh', 'cmd']);
 function stripHeredoc(text: string): string {
   return text.replace(/<<[-]?['"]?(\w+)['"]?[\s\S]*?(?:\r?\n\1\b|$)/g, ' ');
 }
@@ -214,19 +378,189 @@ function stripQuoted(text: string, shell: string): {text: string; ok: boolean} {
   }
   return {text: out, ok: true};
 }
-function commandParts(raw: string, shell = ''): string[] | undefined {
-  let source = raw;
-  if (shell === 'powershell') {
-    // Single-quoted here-strings are literal payloads, including JS $() and quotes.
-    // Leave interpolated or unfinished here-strings for explicit approval.
-    source = source.replace(/@'\r?\n[\s\S]*?\r?\n'@(?=\s|[;|)]|$)/g, ' ');
-    if (/@['"]\r?\n/.test(source)) return;
+// Single-quoted here-strings are literal payloads, including `$()` and quotes.
+// Only PowerShell has them. Interpolated or unfinished here-strings stay unparsed.
+function openCommand(raw: string, shell: string): {text: string; powershell: boolean} | {reason: 'here-string'} {
+  let text = raw;
+  const powershell = shell === 'powershell';
+  if (powershell) {
+    const next = text.replace(/@'\r?\n[\s\S]*?\r?\n'@(?=\s|[;|)]|$)/g, ' ');
+    if (/@['"]\r?\n/.test(next)) return {reason: 'here-string'};
+    text = next;
   }
-  if (/\$\(|\$\{/.test(source)) return;
-  const unquoted = stripQuoted(stripHeredoc(source), shell);
-  if (!unquoted.ok) return;
-  const cleaned = unquoted.text.replace(/\s-m\s+\S+/gi, ' ').replace(/\s-F\s+\S+/gi, ' ');
-  return cleaned.split(/\s*(?:&&|\|\||;|\||&|\r?\n)\s*/).map(p => p.trim()).filter(Boolean);
+  return {text, powershell};
+}
+// With no shell field, `@'` may be a PowerShell here-string or a bash quote that
+// closes at the first `'` and leaves the rest of the line running. Read it both ways.
+function bothShells(raw: string, shell: string): boolean {
+  return shell === '' && /@['"]\r?\n/.test(raw);
+}
+// What bash makes of a here-string read as quotes: a command named by a literal.
+// It runs nothing, so it does not need a checkbox.
+function inertLiteral(cleaned: string): boolean {
+  return /^@\0@(?:\s|$)/.test(cleaned);
+}
+function takeQuote(text: string, i: number, powershell: boolean): {next: number; subst?: '$()' | '${}'} | undefined {
+  const quote = text[i];
+  let subst: '$()' | '${}' | undefined;
+  for (let j = i + 1; j < text.length; j++) {
+    const double = quote === '"';
+    if (powershell ? double && text[j] === '`' : quote !== "'" && text[j] === '\\') {j++; continue;}
+    if (double && text[j] === '$' && (text[j + 1] === '(' || text[j + 1] === '{')) subst = text[j + 1] === '(' ? '$()' : '${}';
+    if (text[j] !== quote) continue;
+    if (powershell && text[j + 1] === quote) {j++; continue;}
+    return {next: j + 1, subst};
+  }
+}
+function takeHeredoc(text: string, i: number): {next: number; subst?: '$()' | '${}'} | undefined {
+  let j = i + 2;
+  if (text[j] === '-') j++;
+  const quote = text[j] === "'" || text[j] === '"' ? text[j] : '';
+  if (quote) j++;
+  const start = j;
+  while (j < text.length && /\w/.test(text[j])) j++;
+  const delim = text.slice(start, j);
+  if (!delim) return;
+  if (quote) {
+    if (text[j] !== quote) return;
+    j++;
+  }
+  const matched = new RegExp('^[\\s\\S]*?(?:\\r?\\n' + delim + '\\b|$)').exec(text.slice(j));
+  if (!matched) return;
+  let subst: '$()' | '${}' | undefined;
+  if (!quote && matched[0].includes('$(')) subst = '$()';
+  else if (!quote && matched[0].includes('${')) subst = '${}';
+  return {next: j + matched[0].length, subst};
+}
+function skipSubst(text: string, i: number): number {
+  const open = text[i + 1], close = open === '(' ? ')' : '}';
+  let depth = 1, quote = '';
+  for (let j = i + 2; j < text.length; j++) {
+    const c = text[j];
+    if (quote) {
+      if (c === '\\' && quote !== "'") {j++; continue;}
+      if (c === quote) quote = '';
+      continue;
+    }
+    if (c === "'" || c === '"') {quote = c; continue;}
+    if (c === open || (c === '$' && (text[j + 1] === '(' || text[j + 1] === '{'))) {
+      if (c === '$') j++;
+      depth++;
+      continue;
+    }
+    if (c === close && --depth === 0) return j + 1;
+  }
+  return -1;
+}
+function splitCommand(text: string, powershell: boolean): {raw: string; subst?: '$()' | '${}'}[] | undefined {
+  const parts: {raw: string; subst?: '$()' | '${}'}[] = [];
+  let cur = '', subst: '$()' | '${}' | undefined;
+  const push = () => {
+    if (cur.trim()) parts.push(subst ? {raw: cur.trim(), subst} : {raw: cur.trim()});
+    cur = ''; subst = undefined;
+  };
+  for (let i = 0; i < text.length;) {
+    const c = text[i];
+    if (powershell && c === '`') {
+      if (i + 1 >= text.length) return;
+      cur += c + text[i + 1]; i += 2; continue;
+    }
+    if (c === '<' && text[i + 1] === '<') {
+      const taken = takeHeredoc(text, i);
+      if (!taken) return;
+      if (taken.subst && !subst) subst = taken.subst;
+      cur += ' '; i = taken.next; continue;
+    }
+    if (c === "'" || c === '"' || (!powershell && c === '`')) {
+      const taken = takeQuote(text, i, powershell);
+      if (!taken) return;
+      if (taken.subst && !subst) subst = taken.subst;
+      cur += text.slice(i, taken.next); i = taken.next; continue;
+    }
+    if (c === '$' && (text[i + 1] === '(' || text[i + 1] === '{')) {
+      const end = skipSubst(text, i);
+      if (end < 0) return;
+      if (!subst) subst = text[i + 1] === '(' ? '$()' : '${}';
+      cur += ' '; i = end; continue;
+    }
+    if (c === '\n' || c === '\r' || c === ';' || c === '|' || c === '&') {
+      if ((c === '|' || c === '&') && text[i + 1] === c) {push(); i += 2; continue;}
+      if (c === '\r' && text[i + 1] === '\n') {push(); i += 2; continue;}
+      if (c === '&' && !cur.trim()) {cur += '&'; i++; continue;}
+      push(); i++; continue;
+    }
+    cur += c; i++;
+  }
+  push();
+  return parts;
+}
+// A leading `&` is PowerShell's call operator. A quoted path is the program.
+// A script block or a variable call still has no visible command.
+function visiblePart(raw: string): {text: string; blocked?: '&'} {
+  const match = raw.match(/^\s*&\s*([\s\S]*)$/);
+  if (!match) return {text: raw};
+  const rest = match[1];
+  if (!rest.trim() || rest[0] === '{' || (rest[0] === '$' && rest[1] !== '(' && rest[1] !== '{')) return {text: rest, blocked: '&'};
+  const quoted = rest.match(/^(?:"([^"\r\n]*)"|'([^'\r\n]*)')([\s\S]*)$/);
+  if (!quoted) return {text: rest};
+  const bin = (quoted[1] ?? quoted[2]).replace(/^.*[/\\]/, '').replace(/\.exe$/i, '');
+  if (!bin || /\s/.test(bin)) return {text: rest, blocked: '&'};
+  return {text: bin + quoted[3]};
+}
+function oneScript(body: string): string | undefined {
+  if (body[0] !== '"' && body[0] !== "'") return body;
+  const quote = body[0];
+  let out = '';
+  for (let i = 1; i < body.length; i++) {
+    if (body[i] === quote) return body.slice(i + 1).trim() ? undefined : out;
+    out += body[i];
+  }
+}
+function wrapperBody(raw: string, bin: string): {body: string; shell: string} | 'opaque' | undefined {
+  if (!wrapperBins.has(bin)) return;
+  const rest = raw.replace(/^\s*(?:"[^"]*"|'[^']*'|\S+)\s*/, '');
+  if (!rest.trim()) return 'opaque';
+  if ((bin === 'powershell' || bin === 'pwsh' || bin === 'cmd') && /-(?:EncodedCommand|File)\b/i.test(rest)) return 'opaque';
+  const shell = bin === 'pwsh' ? 'powershell' : bin;
+  const body = bin === 'cmd' ? /^(?:\/[ds]\s+)*\/c\s+([\s\S]+)$/i.exec(rest)?.[1]
+    : bin === 'powershell' || bin === 'pwsh'
+      ? /^(?:(?:-NoProfile|-NonInteractive|-NoLogo|-ExecutionPolicy\s+\S+)\s+)*-(?:Command|c)\s+([\s\S]+)$/i.exec(rest)?.[1]
+      : /^(?:(?:--noprofile|--norc|-l)\s+)*-(?:lc|c)\s+([\s\S]+)$/i.exec(rest)?.[1];
+  const script = body ? oneScript(body.trim()) : undefined;
+  // `-Command -` reads the script from stdin, `$x` takes it from a variable: neither is visible.
+  if (!script || !script.trim() || /^\s*(?:-|\$)/.test(script)) return 'opaque';
+  // CMD expands these before execution; the resulting command is not visible.
+  if (bin === 'cmd' && /%[^%\r\n]+%|%[0-9*]|![^!\r\n]+!/.test(script)) return 'opaque';
+  // Backtick substitution in a POSIX shell is executable, not a quoted literal.
+  if (shell !== 'powershell' && script.includes('\x60')) return 'opaque';
+  return {body: script, shell};
+}
+function plainPrivilege(head: {bin: string; arg: string}): Privilege | undefined {
+  const key = head.bin.replace(/[^a-z0-9]+/g, '');
+  if (networkBins.has(key)) return 'network';
+  if (shellBins.has(key)) return 'shell';
+  if (head.bin === 'git' && dangerGit.has(head.arg.toLowerCase())) return 'git';
+}
+function commandParts(raw: string, shell = ''): string[] | undefined {
+  if (bothShells(raw, shell)) {
+    const ps = commandParts(raw, 'powershell'), sh = commandParts(raw, 'bash');
+    return ps && sh && ps.join('\n') === sh.join('\n') ? ps : undefined;
+  }
+  const opened = openCommand(raw, shell);
+  if ('reason' in opened) return;
+  const pieces = splitCommand(opened.text, opened.powershell);
+  if (!pieces || pieces.some(piece => piece.subst)) return;
+  const quoteShell = opened.powershell ? 'powershell' : shell;
+  const out: string[] = [];
+  for (const piece of pieces) {
+    const vis = visiblePart(piece.raw);
+    if (vis.blocked) return;
+    const unquoted = stripQuoted(vis.text, quoteShell);
+    if (!unquoted.ok) return;
+    const cleaned = unquoted.text.replace(/\s-m\s+\S+/gi, ' ').replace(/\s-F\s+\S+/gi, ' ').trim();
+    if (cleaned && !inertLiteral(cleaned)) out.push(cleaned);
+  }
+  return out;
 }
 function commandHead(part: string): {bin: string; arg: string} | undefined {
   const tokens = part.replace(/^\s*(?:[A-Za-z_][\w]*=\S+\s+)*/, '').split(/\s+/).filter(Boolean);
@@ -257,27 +591,84 @@ function commandHead(part: string): {bin: string; arg: string} | undefined {
   }
   return {bin, arg: tokens[j] || ''};
 }
-function commandPrivileges(raw: string, shell = ''): {needs: Set<Privilege>; safeCommand: boolean} | 'unparsed' {
-  const parts = commandParts(raw, shell);
-  if (!parts) return 'unparsed';
+// A visible head keeps its checkbox. What still hides the command stays
+// unparsed, and a chain needs every checkbox it touched.
+function readCommand(raw: string, shell = '', depth = 0): {
+  needs: Set<Privilege>; safeCommand: boolean; unsplit: boolean; reason?: string; word?: string;
+} {
+  if (bothShells(raw, shell)) {
+    const ps = readCommand(raw, 'powershell', depth), sh = readCommand(raw, 'bash', depth);
+    const first = ps.reason ? ps : sh;
+    return {
+      needs: new Set([...ps.needs, ...sh.needs]), safeCommand: ps.safeCommand || sh.safeCommand,
+      unsplit: ps.unsplit || sh.unsplit, reason: first.reason, word: first.word
+    };
+  }
   const needs = new Set<Privilege>();
-  let safeCommand = false;
-  if (!parts.length) return 'unparsed';
-  for (const part of parts) {
-    const head = commandHead(part);
-    if (!head) {needs.add('unparsed'); continue;}
-    const key = head.bin.replace(/[^a-z0-9]+/g, '');
-    if (['powershell', 'pwsh', 'bash', 'sh', 'zsh', 'cmd'].includes(head.bin)) needs.add('unparsed');
-    else if (networkBins.has(key)) needs.add('network');
-    else if (shellBins.has(key)) needs.add('shell');
-    else if (head.bin === 'git' && dangerGit.has(head.arg.toLowerCase())) needs.add('git');
+  let safeCommand = false, reason: string | undefined, word: string | undefined;
+  const note = (next: string, token?: string) => {
+    if (reason) return;
+    reason = next;
+    if (token) word = token;
+  };
+  const opened = openCommand(raw, shell);
+  if ('reason' in opened) {
+    needs.add('unparsed');
+    return {needs, safeCommand, unsplit: true, reason: opened.reason};
+  }
+  const pieces = splitCommand(opened.text, opened.powershell);
+  if (!pieces || !pieces.length) {
+    needs.add('unparsed');
+    return {needs, safeCommand, unsplit: true, reason: 'нет головы'};
+  }
+  const quoteShell = opened.powershell ? 'powershell' : shell;
+  for (const piece of pieces) {
+    const vis = visiblePart(piece.raw);
+    if (vis.blocked) {needs.add('unparsed'); note(piece.subst || '&'); continue;}
+    const unquoted = stripQuoted(vis.text, quoteShell);
+    if (!unquoted.ok) {needs.add('unparsed'); note('нет головы'); continue;}
+    const cleaned = unquoted.text.replace(/\s-m\s+\S+/gi, ' ').replace(/\s-F\s+\S+/gi, ' ').trim();
+    if (!piece.subst && inertLiteral(cleaned)) continue;
+    // This scanner handles command chains, not control flow or grouped scripts.
+    // Keep the unknown part while continuing to collect other visible commands.
+    if (/^(?:[({]|(?:if|then|else|elif|elseif|fi|for|foreach|while|until|do|done|switch|case|esac|function|filter|try|catch|finally|trap|begin|process|end)(?=[\s({]|$))/i.test(cleaned)) {
+      needs.add('unparsed'); note(depth ? 'обёртка' : 'нет головы'); continue;
+    }
+    const head = cleaned ? commandHead(cleaned) : undefined;
+    if (!head || head.bin[0] === '{') {needs.add('unparsed'); note(piece.subst || 'нет головы'); continue;}
+    if (piece.subst) {
+      needs.add('unparsed');
+      const priv = plainPrivilege(head);
+      if (priv) needs.add(priv);
+      note(piece.subst, head.bin);
+      continue;
+    }
+    const wrapped = wrapperBody(vis.text, head.bin);
+    if (wrapped) {
+      if (wrapped === 'opaque' || depth >= 3) {needs.add('unparsed'); note('обёртка', head.bin); continue;}
+      const inner = readCommand(wrapped.body, wrapped.shell, depth + 1);
+      for (const item of inner.needs) needs.add(item);
+      if (inner.unsplit) needs.add('unparsed');
+      if (inner.safeCommand) safeCommand = true;
+      if (inner.reason) note(inner.reason, inner.word);
+      else if (inner.unsplit) note('обёртка', head.bin);
+      continue;
+    }
+    const priv = plainPrivilege(head);
+    if (priv) needs.add(priv);
+    else if (wrapperBins.has(head.bin)) {needs.add('unparsed'); note('обёртка', head.bin);}
     else safeCommand = true;
   }
-  return {needs, safeCommand};
+  return {needs, safeCommand, unsplit: false, reason, word};
+}
+function commandPrivileges(raw: string, shell = ''): {needs: Set<Privilege>; safeCommand: boolean} {
+  const read = readCommand(raw, shell);
+  // A failed interpretation must not discard categories found by the other shell.
+  if (read.unsplit) read.needs.add('unparsed');
+  return {needs: read.needs, safeCommand: read.safeCommand};
 }
 function classifyCommand(raw: string, shell = ''): 'command' | 'danger' {
   const found = commandPrivileges(raw, shell);
-  if (found === 'unparsed') return 'danger';
   return found.needs.size ? 'danger' : 'command';
 }
 export function permissionClass(title: string, detail = ''): 'read' | 'edit' | 'command' | 'danger' {
@@ -338,6 +729,39 @@ export function dangerCover(title: string, detail = ''): {needs: Privilege[]; sa
   const safeEdit = Array.isArray(obj?.changes) && obj.changes.some((change: any) => ['add', 'update'].includes(change?.kind?.type ?? change?.kind));
   return {needs: privilegeIds.filter(id => needs.has(id)), safeCommand, ...(safeEdit ? {safeEdit: true} : {})};
 }
+// A command or tool name for the journal. Arguments stay out: a secret often
+// sits there, and field redaction does not see it inside a command string.
+function journalToken(raw: string): string {
+  const token = raw.replace(/^.*[/\\]/, '').replace(/\.exe$/i, '').toLowerCase();
+  if (!token || token.length > 60 || !/^[a-z][a-z0-9._+-]*$/.test(token)) return '';
+  return token;
+}
+export function privilegeJournalHit(title: string, detail = ''): Pick<PrivilegeJournalRow, 'privilege' | 'word' | 'reason'> | undefined {
+  const cover = dangerCover(title, detail);
+  if (!cover) return;
+  const privilege = cover.needs.includes('unparsed') ? 'unparsed' as const
+    : cover.needs.includes('other') ? 'other' as const : undefined;
+  if (!privilege) return;
+  let obj: any, command = '';
+  try {obj = JSON.parse(detail);} catch {obj = undefined;}
+  if (obj && typeof obj === 'object') command = String(obj.rawInput?.command || obj.command || obj.title || '');
+  const extra = detail.trim().startsWith('{') ? '' : detail;
+  const commandText = command || extra;
+  const named = () => {
+    const loose = journalToken((commandText.trim().split(/\s+/)[0] || ''));
+    if (loose) return loose;
+    const tool = String(obj?.name || metaTool(obj).name || title || '').split(/[\s`]/)[0] || '';
+    return journalToken(tool) || 'прочее';
+  };
+  if (privilege === 'other') return {privilege, word: named(), reason: 'прочее'};
+  // A wrapper Codex could not open is not the real command. Do not read inside it.
+  const kind = String(obj?.kind || obj?.toolCall?.kind || obj?._meta?.kind || metaTool(obj).kind || '').toLowerCase();
+  if (kind === 'danger' || !commandText.trim()) {
+    return {privilege, word: named(), reason: commandText.trim() ? 'обёртка' : 'нет текста'};
+  }
+  const read = readCommand(commandText, String(obj?.shell || ''));
+  return {privilege, word: journalToken(read.word || '') || named(), reason: read.reason || 'нет головы'};
+}
 export function permissionSignature(title: string, detail = ''): string | undefined {
   let obj: any, kind = '', command = '';
   try {obj = JSON.parse(detail);} catch {obj = undefined;}
@@ -352,7 +776,7 @@ export function permissionSignature(title: string, detail = ''): string | undefi
     const parts = commandParts(command || extra, String(obj?.shell || '')) || [];
     const bits = parts.map(part => {
       const head = commandHead(part);
-      if (!head) return '';
+      if (!head || wrapperBins.has(head.bin)) return '';
       if (head.bin === 'ssh' && head.arg) return 'ssh ' + head.arg.toLowerCase();
       if (head.bin === 'git' && head.arg) return 'git ' + head.arg.toLowerCase();
       return head.bin;
@@ -393,11 +817,9 @@ export function brief(title: string, limit = 60): string {
 export function riskyPermission(title: string, detail = ''): boolean {
   return permissionClass(title, detail) !== 'read';
 }
+// The card chooses the mode. Words in the message, including «обсуждаем, код не трогать», do not.
 export function assignedMode(text: string, fallback: Mode): Mode {
-  const body = text.trim().replace(/^(?:@)?(колян|claude|жека|codex|гриха|grok)[\s,:]+/iu, '');
-  if (/обсуждаем|код не трогать/iu.test(body)) return 'discuss';
-  if (/^(делай|сделай|исправь|реализуй|создай|напиши|выполни|удали|переименуй)(?=\s|[,.!]|$)/iu.test(body)) return 'execute';
-  if (/^(обсуди|объясни|посмотри|проверь|оцени)(?=\s|[,.!]|$)/iu.test(body)) return 'discuss';
+  void text;
   return fallback;
 }
 export function diskImagePath(text: string): string | undefined {
@@ -503,7 +925,11 @@ export type Input =
   | {type: 'diagnostics'; reducedMotion?: boolean}
   | {type: 'draft'; text: string; recipient: Recipient; responseOrder?: Provider[]; conversationId?: string; attachments?: Attachment[]}
   | {type: 'send'; text: string; recipient: Recipient; responseOrder?: Provider[]; conversationId?: string; attachments?: Attachment[]; discuss?: boolean}
-  | {type: 'layout'; side: 'left' | 'right'; width: number}
+  | {type: 'layout'; side: 'left' | 'right'; width: number; agentsFolded?: boolean; queueFolded?: boolean; draftHeight?: number}
+  | {type: 'pause'; on: boolean}
+  | {type: 'queue-edit'; messageId: string; text: string}
+  | {type: 'queue-move'; messageId: string; before?: string}
+  | {type: 'queue-remove'; messageId: string}
   | {type: 'reset'; mode: 'context' | 'conversation'; conversationId?: string; provider?: Provider}
   | {type: 'fresh-summary'; provider: Provider; conversationId?: string}
   | {type: 'feed-max'; count: number; conversationId?: string}
@@ -530,9 +956,16 @@ export function input(value: unknown): Input | undefined {
   if (v.type === 'copy' && typeof v.text === 'string' && v.text.length <= 20000) return {type: 'copy', text: v.text};
   if (v.attachments !== undefined && !validAttachments(v.attachments)) return;
   if (v.conversationId !== undefined && typeof v.conversationId !== 'string') return;
-  if (v.responseOrder !== undefined && (!Array.isArray(v.responseOrder) || v.responseOrder.length > 3 || v.responseOrder.some((p: unknown) => !isProvider(p)) || new Set(v.responseOrder).size !== v.responseOrder.length)) return;
+  if (v.responseOrder !== undefined && (!Array.isArray(v.responseOrder) || v.responseOrder.length > 10 || v.responseOrder.some((p: unknown) => !isProvider(p)))) return;
   if (v.discuss !== undefined && typeof v.discuss !== 'boolean') return;
-  if (v.type === 'layout' && ['left', 'right'].includes(v.side) && typeof v.width === 'number' && Number.isFinite(v.width) && v.width >= 260 && v.width <= 600) return v as Input;
+  if (v.type === 'layout' && ['left', 'right'].includes(v.side) && typeof v.width === 'number' && Number.isFinite(v.width) && v.width >= 260 && v.width <= 600
+    && (v.agentsFolded === undefined || typeof v.agentsFolded === 'boolean')
+    && (v.queueFolded === undefined || typeof v.queueFolded === 'boolean')
+    && (v.draftHeight === undefined || (typeof v.draftHeight === 'number' && Number.isFinite(v.draftHeight) && v.draftHeight >= 64 && v.draftHeight <= 4000))) return v as Input;
+  if (v.type === 'pause' && typeof v.on === 'boolean') return v as Input;
+  if (v.type === 'queue-edit' && typeof v.messageId === 'string' && typeof v.text === 'string' && v.text.length <= 1000000) return v as Input;
+  if (v.type === 'queue-move' && typeof v.messageId === 'string' && (v.before === undefined || typeof v.before === 'string')) return v as Input;
+  if (v.type === 'queue-remove' && typeof v.messageId === 'string') return v as Input;
   if (v.type === 'reset' && ['context', 'conversation'].includes(v.mode)
     && (v.provider === undefined || isProvider(v.provider))) return v as Input;
   if (v.type === 'fresh-summary' && isProvider(v.provider)) return v as Input;

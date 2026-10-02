@@ -1,5 +1,5 @@
-import {State, Provider, Recipient, Turn, Agent, Message, id, names, context, contextFit, afterMessage, addressed, assignedMode, stopTarget, fresh, Attachment, validAttachments, messageText, permissionClass, permissionSignature, permissionCaption, brief, questionNumber, normalizeInstruction, agentPromptPrefix, summaryPrompt, summaryComfort, privilegeIds, Privilege, dangerCover} from '../shared/model';
-import {Store} from '../storage/store';
+import {State, Provider, Recipient, Turn, Agent, Message, id, names, context, contextFit, afterMessage, addressed, assignedMode, stopTarget, fresh, Attachment, validAttachments, messageText, permissionClass, permissionSignature, permissionCaption, brief, questionNumber, normalizeInstruction, agentPromptPrefix, passLine, passMarks, passSpan, placeDiscussLine, summaryPrompt, summaryComfort, privilegeIds, Privilege, dangerCover, privilegeJournalHit, PrivilegeJournalRow} from '../shared/model';
+import {Store, shortError} from '../storage/store';
 import {ProjectLock} from '../processes/lock';
 import {runProvider, RunOptions, RunResult, UsageReport, extractQuota} from '../providers/adapter';
 import {QuestionItem, QuestionAnswers, answerLabels, questionKey} from '../shared/model';
@@ -8,6 +8,7 @@ export interface Host {
   root: string; lockBase: string; jobRunner: string;
   cli(p: Provider): Promise<string>; limit(): number; timeout(execute: boolean): number;
   ceiling(): number;
+  maxResponders?(): number;
   notify?(kind: 'done' | 'permission', text: string): void;
   finished?(turn: Turn): Promise<void>;
   changed(): void; prepare(turn: Turn, signal: AbortSignal): Promise<string | undefined>; trusted(): boolean;
@@ -39,12 +40,24 @@ export class Controller {
   private questions = new Map<string, (answers?: QuestionAnswers) => void>();
   private abort?: AbortController;
   private work?: Promise<void>;
+  // Engine-closed turns are interrupted, but they are not Anton's Stop.
+  private engineStops = new Set<string>();
   resetting = false;
   compacting?: Provider | 'all';
   private available() {if (this.resetting) throw new Error('Дождитесь завершения очистки разговора.');}
   private currentMessages() {
     const start = this.state.contextStart ? this.state.messages.findIndex(m => m.id === this.state.contextStart) + 1 : 0;
-    return this.state.messages.slice(start).filter(m => !m.control);
+    return this.state.messages.slice(start).filter(m => {
+      if (!m.control) return true;
+      if (!m.turn) return false;
+      const turn = this.state.turns.find(t => t.id === m.turn);
+      return !!turn && (turn.status === 'failed' || turn.status === 'interrupted');
+    });
+  }
+  private responderCap(): number {
+    const n = this.host.maxResponders?.();
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 1) return 3;
+    return Math.min(n, 10);
   }
   private streamingSave?: ReturnType<typeof setTimeout>;
   get busy() {return !!this.active || !!this.compacting;}
@@ -103,6 +116,8 @@ export class Controller {
   }
   // Cleared at the end of every turn: a blanket approval never outlives the answer it was given for.
   private blanket = new Set<Provider>();
+  // Catch-all privilege hits for this turn. Flushed once, after the turn ends.
+  private privilegeRows: PrivilegeJournalRow[] = [];
   // In-memory until Reload, context reset or a new conversation.
   private standing = new Map<Provider, Set<string>>();
   async recover() {
@@ -155,26 +170,35 @@ export class Controller {
       this.state.messages.push({id: id(), author: 'Антон', text, at: Date.now()}); this.state.draft = ''; await this.save(); return;
     }
     const enabled = this.state.agents.filter(a => a.enabled);
-    if (responseOrder.length > 3 || new Set(responseOrder).size !== responseOrder.length || responseOrder.some(p => !enabled.some(a => a.id === p))) throw new Error('Выберите включённых участников без повторов.');
+    const cap = this.responderCap();
+    if (responseOrder.length > cap) throw new Error('Не больше ' + cap + ' отвечающих за цикл.');
+    if (responseOrder.some(p => !enabled.some(a => a.id === p))) throw new Error('Выберите включённых участников.');
     // Explicit numbered selection takes priority; without it normal chat addressing applies.
     recipient = responseOrder.length ? 'all' : addressed(text) || recipient;
     if (recipient !== 'all' && !enabled.some(a => a.id === recipient)) throw new Error(names[recipient] + ' выключен. Включите его карточку.');
-    if (discuss && text.trim() && !/обсуждаем|код не трогать/iu.test(text)) {
-      text = text.replace(/\s+$/u, '') + '\n\nобсуждаем, код не трогать';
-    }
+    if (discuss && text.trim()) text = placeDiscussLine(text);
     const messageId = id();
     const recipients: Recipient[] = responseOrder.length ? responseOrder : [recipient];
+    const span = passSpan(passMarks(text), recipients.length);
     const inflight = [
       ...this.state.queue.map(qid => this.state.turns.find(t => t.id === qid)).filter((t): t is Turn => !!t),
       ...this.state.turns.filter(t => t.status === 'preparing' || t.status === 'running')
     ];
     const cycle = (!this.busy && this.state.queue.length === 0) ? 1
       : Math.max(0, ...inflight.map(t => t.cycle || 1)) + 1;
-    const turns: Turn[] = recipients.map(p => ({id: id(), messageId, recipient: p, status: 'proposed' as const,
-      cycle, ...(discuss ? {mode: 'discuss' as const} : {})}));
+    const turns: Turn[] = recipients.map((p, index) => ({id: id(), messageId, recipient: p, status: 'proposed' as const,
+      cycle, ...(span > 1 ? {pass: index + 1} : {}), ...(discuss ? {mode: 'discuss' as const} : {})}));
     this.state.messages.push({id: messageId, author: 'Антон', text, at: Date.now(),
-      attachments: structuredClone(attachments), turn: turns[0].id});
-    this.state.turns.push(...turns); this.state.queue.push(...turns.map(t => t.id));
+      attachments: structuredClone(attachments), turn: turns[0].id, discuss});
+    this.state.turns.push(...turns);
+    // During a pause the question goes out of turn and the pause is over. It waits only for the
+    // remaining steps of a question already started, then goes before every untouched one.
+    if (this.state.paused) {
+      const queued = this.queuedTurns();
+      let pinned = 0;
+      while (pinned < queued.length && !this.untouched(queued[pinned].messageId)) pinned++;
+      this.state.queue.splice(pinned, 0, ...turns.map(t => t.id)); this.state.paused = false; this.renumberCycles();
+    } else this.state.queue.push(...turns.map(t => t.id));
     this.state.draft = ''; this.state.responseOrder = []; this.state.draftAttachments = [];
     const first = turns[0];
     const provider = first.recipient === 'all'
@@ -194,6 +218,7 @@ export class Controller {
     if (turn) {
       const first = this.state.queue.map(x => this.state.turns.find(t => t.id === x)!).find(t => t.messageId === turn!.messageId);
       if (first?.id !== turn.id) throw new Error('Сначала дайте слово предыдущему участнику этого вопроса.');
+      if (this.state.paused) throw new Error('Очередь на паузе. Нажмите «Продолжить».');
     } else {
       // A click authorizes a run; it is not a fabricated human utterance.
       const source = this.currentMessages().filter(m => m.author === 'Антон' && this.state.turns.some(t => t.messageId === m.id)).at(-1);
@@ -201,14 +226,28 @@ export class Controller {
       const pending = this.state.queue.map(x => this.state.turns.find(t => t.id === x)!).find(t => t.messageId === source.id);
       if (pending) {
         if (pending.recipient !== 'all' && pending.recipient !== provider) throw new Error('Следующий участник уже выбран в очереди.');
+        if (this.state.paused) throw new Error('Очередь на паузе. Нажмите «Продолжить».');
         turn = pending;
       } else {
-        turn = {id: id(), messageId: source.id, recipient: provider, status: 'proposed', mode: 'discuss',
+        turn = {id: id(), messageId: source.id, recipient: provider, status: 'proposed',
+          mode: this.readingMessage(source.id) ? 'discuss' : (this.state.agents.find(a => a.id === provider)?.mode || 'discuss'),
           cycle: this.state.turns.find(t => t.messageId === source.id)?.cycle};
         this.state.turns.push(turn);
       }
     }
     this.start(turn, provider); await this.save();
+  }
+  // The button is stored on the message. A post from before that flag still
+  // counts when its discuss turn belongs to a card that is currently Правки.
+  private readingMessage(messageId: string): boolean {
+    const message = this.state.messages.find(m => m.id === messageId);
+    if (message?.discuss === true) return true;
+    if (message?.discuss === false) return false;
+    return this.state.turns.some(t => {
+      if (t.messageId !== messageId || t.mode !== 'discuss' || t.summary) return false;
+      if (!t.executor) return true;
+      return this.state.agents.find(a => a.id === t.executor)?.mode === 'execute';
+    });
   }
   async retry(turnId: string) {
     this.available();
@@ -221,7 +260,7 @@ export class Controller {
       throw new Error((provider ? names[provider] : 'Участник') + ' выключен.');
     if (!this.state.messages.some(m => m.id === failed.messageId)) throw new Error('Поручение не найдено.');
     const turn: Turn = {id: id(), messageId: failed.messageId, recipient: failed.recipient, status: 'proposed',
-      mode: failed.mode, cycle: failed.cycle, ...(failed.summary ? {summary: true} : {})};
+      mode: failed.mode, cycle: failed.cycle, ...(failed.pass ? {pass: failed.pass} : {}), ...(failed.summary ? {summary: true} : {})};
     this.state.turns.push(turn);
     this.start(turn, provider); await this.save();
   }
@@ -265,7 +304,7 @@ export class Controller {
         // New sessions start empty, so the reported occupancy no longer describes anything.
         this.state.sessions = {}; this.state.usage = {}; this.state.conversationId = id(); this.state.responseOrder = [];
         for (const turn of this.state.turns) if (turn.status === 'proposed') turn.status = 'interrupted';
-        this.state.queue = [];
+        this.state.queue = []; this.state.paused = false;
         const marker = {id: id(), author: 'Trio' as const, at: Date.now(), text: 'Контекст сброшен для всех участников. Предыдущая переписка остаётся только в ленте.', control: true};
         this.state.messages.push(marker); this.state.contextStart = marker.id;
       }
@@ -321,12 +360,85 @@ export class Controller {
     this.available();
     const turn = this.state.turns.find(t => t.id === turnId && t.status === 'proposed');
     if (!turn) return;
-    turn.status = 'interrupted'; this.state.queue = this.state.queue.filter(x => x !== turnId);
+    this.drop(turn); this.renumberCycles();
+    await this.save();
+  }
+  private drop(turn: Turn) {
+    turn.status = 'interrupted'; this.state.queue = this.state.queue.filter(x => x !== turn.id);
     const group = this.state.turns.filter(t => t.messageId === turn.messageId);
     if (!group.some(t => t.executor || t.status === 'proposed')) {
       const message = this.state.messages.find(m => m.id === turn.messageId);
       if (message) message.cancelled = true;
     }
+  }
+  private queuedTurns() {
+    return this.state.queue.map(x => this.state.turns.find(t => t.id === x)).filter((t): t is Turn => !!t);
+  }
+  // Untouched: nobody has started on it yet. Only such a question can be edited or moved.
+  private untouched(messageId: string) {
+    const group = this.state.turns.filter(t => t.messageId === messageId);
+    return group.some(t => this.state.queue.includes(t.id)) && !group.some(t => t.executor || t.summary);
+  }
+  // Cycle numbers follow the queue order after an insert, a move or a removal.
+  private renumberCycles() {
+    const live = this.active ? this.state.turns.find(t => t.id === this.active!.turnId) : undefined;
+    const queued = this.queuedTurns().filter(t => !t.summary);
+    if (!queued.length) return;
+    let n = live ? live.cycle || 1 : Math.min(...queued.map(t => t.cycle || 1)) - 1;
+    const seen = new Map<string, number>();
+    for (const t of queued) {
+      if (!seen.has(t.messageId)) seen.set(t.messageId, live?.messageId === t.messageId ? live.cycle || 1 : ++n);
+      t.cycle = seen.get(t.messageId);
+    }
+  }
+  async pause(on: boolean) {
+    this.available();
+    if (on) {this.state.paused = true; await this.save(); return;}
+    this.state.paused = false;
+    // Продолжить: with nobody answering, the next queued step starts right away.
+    const next = this.busy ? undefined : this.queuedTurns().find(t => t.status === 'proposed');
+    if (next) {
+      const provider = next.recipient === 'all' ? this.state.agents.find(a => a.enabled)?.id : next.recipient;
+      if (!provider || !this.state.agents.find(a => a.id === provider)?.enabled) {
+        await this.save();
+        throw new Error((provider ? names[provider] : 'Участник') + ' выключен. Включите его карточку или снимите этот шаг.');
+      }
+      this.start(next, provider);
+    }
+    await this.save();
+  }
+  async editQueued(messageId: string, text: string) {
+    this.available();
+    const message = this.state.messages.find(m => m.id === messageId && m.author === 'Антон');
+    if (!message || !this.untouched(messageId)) throw new Error('Править можно только вопрос, на который ещё не начали отвечать.');
+    if (!text.trim() && !message.attachments?.length) throw new Error('Пустой вопрос. Чтобы убрать его, нажмите «Удалить».');
+    if (messageText({text, attachments: message.attachments}).length > this.host.limit())
+      throw new Error('Текст и вложения превышают лимит контекста Trio.');
+    message.text = text;
+    await this.save();
+  }
+  async moveQueued(messageId: string, before?: string) {
+    this.available();
+    if (!this.untouched(messageId)) throw new Error('Перенести можно только вопрос, на который ещё не начали отвечать.');
+    if (before === messageId) return;
+    const own = this.queuedTurns().filter(t => t.messageId === messageId).map(t => t.id);
+    const rest = this.queuedTurns().filter(t => t.messageId !== messageId);
+    let at = before ? rest.findIndex(t => t.messageId === before) : rest.length;
+    if (at < 0) throw new Error('Этого вопроса уже нет в очереди.');
+    // Started questions and a pending summary stay on top.
+    let pinned = 0;
+    while (pinned < rest.length && !this.untouched(rest[pinned].messageId)) pinned++;
+    at = Math.max(at, pinned);
+    this.state.queue = [...rest.slice(0, at).map(t => t.id), ...own, ...rest.slice(at).map(t => t.id)];
+    this.renumberCycles();
+    await this.save();
+  }
+  async removeQueued(messageId: string) {
+    this.available();
+    const turns = this.queuedTurns().filter(t => t.messageId === messageId && t.status === 'proposed');
+    if (!turns.length) return;
+    for (const turn of turns) this.drop(turn);
+    this.renumberCycles();
     await this.save();
   }
   private start(turn: Turn, provider: Provider) {
@@ -347,7 +459,9 @@ export class Controller {
     }).finally(async () => {
       if (this.streamingSave) clearTimeout(this.streamingSave); this.streamingSave = undefined;
       if (!turn.endedAt) turn.endedAt = Date.now();
-      if (turn.status === 'interrupted') this.note(names[provider] + ': остановлен' + (turn.replyId ? '. Частичный ответ сохранён.' : ' до получения ответа.'));
+      const selfBroken = turn.status === 'failed' || (turn.status === 'interrupted' && this.engineStops.has(turn.id));
+      if (turn.status === 'interrupted' && !this.engineStops.delete(turn.id))
+        this.note(names[provider] + ': остановлен' + (turn.replyId ? '. Частичный ответ сохранён.' : ' до получения ответа.'));
       if (turn.status === 'completed') this.host.notify?.('done', names[provider] + ' ответил');
       else if (turn.status === 'failed') this.host.notify?.('done', names[provider] + ': ошибка');
       for (const answer of this.replies.values()) answer(false);
@@ -356,7 +470,7 @@ export class Controller {
       for (const ask of this.questions.values()) ask();
       this.questions.clear();
       try {
-        await this.afterTurn(turn);
+        await this.afterTurn(turn, selfBroken);
         await this.save();
       } catch (e) {this.state.diagnostics.push(String(e)); this.host.changed();}
     });
@@ -372,13 +486,13 @@ export class Controller {
     if (!this.state.privileges?.length) this.state.privilegeOn = false;
     await this.save();
   }
-  private async afterTurn(done: Turn) {
+  private async afterTurn(done: Turn, selfBroken = false) {
     if (done.summary) {
-      if (await this.settleSummary(done)) await this.continueAuto(done);
+      if (await this.settleSummary(done)) await this.continueAuto(done, selfBroken);
       return;
     }
     const pending = this.state.turns.find(t => t.summary && t.status === 'proposed');
-    if (!pending) {await this.continueAuto(done); return;}
+    if (!pending) {await this.continueAuto(done, selfBroken); return;}
     const provider = pending.recipient === 'all' ? undefined : pending.recipient;
     const enabled = !!provider && !!this.state.agents.find(a => a.id === provider)?.enabled;
     if (done.status === 'completed' && enabled && provider && !this.busy) {
@@ -420,12 +534,13 @@ export class Controller {
     if (message && !group.some(t => t.executor || t.status === 'proposed')) message.cancelled = true;
     this.note(text);
   }
-  private async continueAuto(done: Turn) {
-    if (!this.state.autoReply || this.busy || this.resetting) return;
-    if (done.status !== 'completed') return;
+  private async continueAuto(done: Turn, selfBroken = false) {
+    if (!this.state.autoReply || this.state.paused || this.busy || this.resetting) return;
     const next = this.state.queue.map(id => this.state.turns.find(t => t.id === id))
       .find((t): t is Turn => !!t && t.status === 'proposed');
     if (!next) return;
+    const carried = done.status === 'completed' || (selfBroken && next.messageId === done.messageId);
+    if (!carried) return;
     const provider = next.recipient === 'all'
       ? this.state.agents.find(a => a.enabled)?.id
       : next.recipient;
@@ -494,7 +609,9 @@ export class Controller {
         + 'больше твоего окна. Иди частями от конца к началу, ранние темы ищи поиском. '
         + 'Поручения из раздела «Очередь» перенеси в сводку как ожидающие исполнения, с адресатами и порядком; '
         + 'не исполняй их. Старые поручения в файле — история, текущее задание — только подготовка сводки.' : '';
+      const pass = passLine(turn, this.state.turns, source.text);
       const prompt = agentPromptPrefix(agent, turn.mode === 'execute' ? 'execute' : 'discuss') + '\n'
+        + (pass ? pass + '\n' : '')
         + context(history, messageText(source), this.host.limit(),
           {messages: this.state.messages, turns: this.state.turns}) + summaryContext;
       this.state.diagnostics.push(agent.id + ' prompt: ' + prompt.length + ' символов, '
@@ -543,10 +660,21 @@ export class Controller {
           this.host.changed();
         }
       });
-      reply.text = result.text || reply.text; reply.partial = !!result.error || !!result.denied || result.interrupted || signal.aborted;
+      reply.text = result.text || reply.text;
+      reply.partial = !!result.error || !!result.denied || result.interrupted || signal.aborted || !!result.cancelled;
       if (result.denied) {
         turn.status = 'failed';
         this.note(names[agent.id] + ' остановился: не разрешили ' + result.denied, false, true, undefined, undefined, turn.id);
+      } else if (result.cancelled && !signal.aborted) {
+        turn.status = 'interrupted';
+        this.engineStops.add(turn.id);
+        const nextProposed = this.state.queue.map(qid => this.state.turns.find(t => t.id === qid))
+          .find(t => !!t && t.status === 'proposed');
+        const continues = !!this.state.autoReply && !this.state.paused
+          && !!nextProposed && nextProposed.messageId === turn.messageId;
+        const why = result.refused ? ': движок закрыл ход после отказа в действии' : ': движок закрыл ход';
+        const stopped = !!this.state.autoReply && !!nextProposed && !continues;
+        this.note(names[agent.id] + why + (stopped ? '. Очередь остановлена' : ''), false, true, undefined, undefined, turn.id);
       } else {
         turn.status = result.interrupted || signal.aborted ? 'interrupted' : result.error ? 'failed' : 'completed';
         if (result.error) this.note(result.error, true, false, undefined, undefined, turn.id);
@@ -569,6 +697,7 @@ export class Controller {
       // Remove both source files while still owning the lock, including failed writes.
       if (turn.summary) await this.store.dropSummarySource(this.host.root)
         .catch(e => {this.state.diagnostics.push('summary source: ' + String(e));});
+      await this.flushPrivilegeJournal();
       await this.save();
       await lock.release();
       await this.host.finished?.(turn);
@@ -641,10 +770,12 @@ export class Controller {
     if (signal.aborted) return Promise.resolve(false);
     if (this.autoAllow(title, detail, provider)) {
       this.appendAuto(provider, title, detail);
+      this.rememberPrivilege(provider, title, detail, 'само');
       return Promise.resolve(true);
     }
     if (this.blanket.has(provider)) {
       this.appendAction(provider, title, detail);
+      this.rememberPrivilege(provider, title, detail, 'разрешено');
       return Promise.resolve(true);
     }
     const signature = permissionSignature(title, detail);
@@ -684,7 +815,26 @@ export class Controller {
     } else {
       this.note((allow ? 'Разрешено один раз' : 'Отказано') + ': ' + names[p.provider] + ' · ' + brief(p.title), false, true, p.detail);
     }
+    this.rememberPrivilege(p.provider, p.title, p.detail, allow ? 'разрешено' : 'отказ');
     answer(allow); void this.save().catch(e => {this.state.diagnostics.push(String(e));});
+  }
+  private rememberPrivilege(provider: Provider, title: string, detail: string, outcome: PrivilegeJournalRow['outcome']) {
+    if (!this.state.privilegeOn) return;
+    const hit = privilegeJournalHit(title, detail);
+    if (!hit) return;
+    this.privilegeRows.push({at: new Date().toISOString(), agent: names[provider], word: hit.word, privilege: hit.privilege, reason: hit.reason, outcome});
+  }
+  private async flushPrivilegeJournal() {
+    if (!this.privilegeRows.length) return;
+    const rows = this.privilegeRows;
+    this.privilegeRows = [];
+    try {
+      const file = await this.store.appendPrivilegeJournal(this.host.root, rows);
+      this.note('Журнал привилегий: ' + file, false, true);
+    } catch (e) {
+      this.state.diagnostics.push('privilege journal: ' + String(e));
+      this.note('Журнал привилегий не записан. ' + shortError(e), true, true);
+    }
   }
   private appendStanding(provider: Provider, title: string, detail: string) {
     const item = {title: brief(title), detail};

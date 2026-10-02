@@ -118,6 +118,7 @@ function webview() {
     }
     getBoundingClientRect() {return {left:0,top:0,right:0,bottom:0,width:0,height:0};}
     focus() {this.focused=true;}
+    setPointerCapture() {}
     scrollIntoView() {this.scrolled=true;}
     normalize() {
       if (!this.childNodes) return;
@@ -255,13 +256,401 @@ test('cancelled or failed file selection preserves draft and unlocks send',()=>{
 test('numbered selection submits order once and clears after acknowledgment',()=>{
  const {nodes,requests,respond}=webview();
  nodes['response-order'].children[1].onclick();nodes['response-order'].children[0].onclick();
- assert.deepEqual(nodes['response-order'].children.map(b=>b.textContent),['2 Колян','1 Жека']);
+ assert.deepEqual(nodes['response-order'].children.map(b=>b.textContent),['Колян','Жека']);
+ assert.deepEqual(nodes['response-order'].children.map(b=>b.attributes['aria-pressed']),['true','true']);
  nodes.draft.value='Two opinions';nodes.composer.onsubmit({preventDefault(){}});
  nodes.composer.onsubmit({preventDefault(){}});
  assert.equal(requests('send').length,1);
  assert.deepEqual(Array.from(requests('send')[0].responseOrder),['codex','claude']);
  respond(requests('send')[0]);assert.equal(nodes.draft.value,'');
  assert.ok(nodes['response-order'].children.every(b=>b.attributes['aria-pressed']==='false'));
+ assert.equal(nodes['order-strip'].hidden,true);
+ assert.equal(nodes['order-hint'].hidden,false);
+});
+
+test('order clicks append a repeat, the ceiling adds nothing, and a cross removes one step',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,publish}=webview();
+ const state=fresh();
+ state.agents.forEach(a=>{a.enabled=true;});
+ publish(state);
+ assert.equal(nodes['order-strip'].hidden,true);
+ assert.equal(nodes['order-hint'].hidden,false);
+ assert.match(nodes['order-hint'].textContent,/Выбери отвечающих/);
+ const order=nodes['response-order'].children;
+ order[0].onclick();order[0].onclick();order[1].onclick();
+ const buttons=nodes['response-order'].children;
+ assert.equal(nodes['order-strip'].hidden,false);
+ assert.equal(nodes['order-hint'].hidden,true);
+ assert.deepEqual(nodes['order-strip'].children.filter(s=>!s.classList.contains('order-clear')).map(s=>s.querySelector('.order-step-main').textContent),['Колян','Колян','Жека']);
+ assert.deepEqual(nodes['order-strip'].children.filter(s=>!s.classList.contains('order-clear')).map(s=>s.querySelector('.order-step-no').textContent),['1','2','3']);
+ assert.equal(buttons[0].tag,'button');
+ const cross=nodes['order-strip'].children[0].querySelector('.order-step-x');
+ assert.equal(cross.tag,'span');
+ assert.equal(cross.attributes.role,'button');
+ assert.equal(buttons[0].textContent,'Колян');
+ assert.equal(buttons[1].textContent,'Жека');
+ assert.equal(buttons[2].textContent,'Гриха');
+ buttons[2].onclick();
+ assert.equal(nodes['order-strip'].children.length,4,'three steps and Очистить');
+ nodes['order-strip'].children[0].querySelector('.order-step-x').onclick();
+ assert.deepEqual(nodes['order-strip'].children.filter(s=>!s.classList.contains('order-clear')).map(s=>s.querySelector('.order-step-main').textContent),['Колян','Жека']);
+ nodes['order-strip'].children[0].querySelector('.order-step-x').onclick();
+ nodes['order-strip'].children[0].querySelector('.order-step-x').onclick();
+ assert.equal(nodes['order-strip'].hidden,true);
+ assert.equal(nodes['order-hint'].hidden,false);
+ assert.match(nodes['order-hint'].textContent,/Выбери отвечающих/);
+});
+
+test('a snapshot ceiling above 10 stops at ten steps',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,publish}=webview();
+ publish(fresh(),undefined,false,[],undefined,undefined,undefined,undefined,{maxResponders:12});
+ const order=nodes['response-order'].children;
+ for (let i=0;i<11;i++) order[0].onclick();
+ assert.equal(nodes['order-strip'].children.filter(s=>!s.classList.contains('order-clear')).length,10);
+});
+
+test('a snapshot ceiling of one keeps the second click off the chain',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,publish}=webview();
+ publish(fresh(),undefined,false,[],undefined,undefined,undefined,undefined,{maxResponders:1});
+ nodes['response-order'].children[0].onclick();
+ nodes['response-order'].children[1].onclick();
+ assert.equal(nodes['order-strip'].children.length,2,'one step and Очистить');
+ assert.equal(nodes['order-strip'].children[0].querySelector('.order-step-main').textContent,'Колян');
+});
+
+test('order plates take the agent colour, the chosen buttons too, and Очистить drops the whole chain',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,publish}=webview();
+ const state=fresh();
+ state.agents.forEach(a=>{a.enabled=true;});
+ publish(state);
+ const order=nodes['response-order'].children;
+ order[2].onclick();order[0].onclick();order[2].onclick();
+ const strip=nodes['order-strip'].children;
+ assert.deepEqual(strip.slice(0,3).map(s=>['plate-claude','plate-codex','plate-grok'].find(c=>s.classList.contains(c))),['plate-grok','plate-claude','plate-grok']);
+ const clear=strip.at(-1);
+ assert.equal(clear.classList.contains('order-clear'),true);
+ assert.equal(clear.textContent,'Очистить');
+ assert.equal(clear.querySelector('.order-step-x'),null,'Очистить has no cross');
+ const buttons=nodes['response-order'].children;
+ assert.equal(buttons[0].classList.contains('plate-claude'),true);
+ assert.equal(buttons[2].classList.contains('plate-grok'),true);
+ clear.onclick();
+ assert.equal(nodes['order-strip'].hidden,true);
+ assert.ok(nodes['response-order'].children.every(b=>b.attributes['aria-pressed']==='false'));
+});
+
+function chips(nodes) {
+ return nodes['order-strip'].children.filter(s => !s.classList.contains('order-clear'));
+}
+function enableAll(publish) {
+ const {fresh} = require('../dist/shared/model');
+ const state = fresh();
+ state.agents.forEach(a => {a.enabled = true;});
+ publish(state);
+ return state;
+}
+
+test('dragging a chip rewrites marker names and leaves numbers and task text',()=>{
+ const {nodes,publish}=webview();
+ enableAll(publish);
+ const source='[Проход 1 из 3: Колян]\nсделай\n[Проход 2 из 3: Жека]\nпроверь\n[Проход 3 из 3: Гриха]\nещё';
+ nodes.draft.value=source;
+ nodes.draft.oninput();
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян','Жека','Гриха']);
+ assert.equal(nodes.draft.value,source);
+ const first=chips(nodes)[0];
+ assert.equal(first.draggable,true);
+ first.ondragstart({dataTransfer:{setData(){},effectAllowed:''}});
+ assert.equal(first.classList.contains('dragging'),true);
+ chips(nodes)[2].ondrop({preventDefault(){},stopPropagation(){}});
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Жека','Гриха','Колян']);
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-no').textContent),['1','2','3']);
+ assert.equal(nodes.draft.value,'[Проход 1 из 3: Жека]\nсделай\n[Проход 2 из 3: Гриха]\nпроверь\n[Проход 3 из 3: Колян]\nещё');
+ assert.equal(nodes['pass-hint'].hidden,true);
+});
+
+test('removing a chip shifts the next assignee and a spare marker becomes ?',()=>{
+ const {nodes,publish}=webview();
+ enableAll(publish);
+ nodes.draft.value='[Проход 1 из 3: Колян]\nсделай\n[Проход 2 из 3: Жека]\nпроверь\n[Проход 3 из 3: Гриха]\nещё';
+ nodes.draft.oninput();
+ chips(nodes)[0].querySelector('.order-step-x').onclick();
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Жека','Гриха']);
+ assert.equal(nodes.draft.value,'[Проход 1 из 3: Жека]\nсделай\n[Проход 2 из 3: Гриха]\nпроверь\n[Проход 3 из 3: ?]\nещё');
+ assert.match(nodes['pass-hint'].textContent,/Кто будет выполнять проход 3\? Добавь исполнителя или убери пункт\./);
+ assert.equal(nodes.send.disabled,false);
+ nodes['order-strip'].children.at(-1).onclick();
+ assert.equal(nodes['order-strip'].hidden,true);
+ assert.equal(nodes.draft.value,'[Проход 1 из 3: ?]\nсделай\n[Проход 2 из 3: ?]\nпроверь\n[Проход 3 из 3: ?]\nещё');
+ assert.match(nodes['pass-hint'].textContent,/Кто будет выполнять проход 1\?/);
+ assert.doesNotMatch(nodes['pass-hint'].textContent,/выключен/);
+});
+
+test('picking the chain again after Очистить writes those names back into the marks',()=>{
+ const {nodes,publish}=webview();
+ enableAll(publish);
+ nodes.draft.value='[Проход 1 из 2: Колян]\nа\n[Проход 2 из 2: Жека]\nб';
+ nodes.draft.oninput();
+ nodes['order-strip'].children.at(-1).onclick();
+ assert.equal(nodes.draft.value,'[Проход 1 из 2: ?]\nа\n[Проход 2 из 2: ?]\nб');
+ nodes['response-order'].children[2].onclick();
+ nodes['response-order'].children[0].onclick();
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Гриха','Колян']);
+ assert.equal(nodes.draft.value,'[Проход 1 из 2: Гриха]\nа\n[Проход 2 из 2: Колян]\nб');
+ assert.equal(nodes['pass-hint'].hidden,true);
+});
+
+test('plain text without marks stays unmarked and draws no pass warning',()=>{
+ const {nodes,requests,publish}=webview();
+ enableAll(publish);
+ nodes.draft.value='обычное поручение';
+ nodes.draft.oninput();
+ nodes['response-order'].children[0].onclick();
+ assert.equal(nodes.draft.value,'обычное поручение');
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян']);
+ assert.equal(nodes['pass-hint'].hidden,true);
+ nodes.composer.onsubmit({preventDefault(){}});
+ assert.equal(requests('send')[0].text,'обычное поручение');
+ assert.deepEqual(Array.from(requests('send')[0].responseOrder),['claude']);
+});
+
+test('an extra chip warns and does not block send',()=>{
+ const {nodes,requests,publish}=webview();
+ enableAll(publish);
+ nodes['response-order'].children[0].onclick();
+ nodes['response-order'].children[1].onclick();
+ nodes.draft.value='[Проход 1 из 2: Колян]\nдело';
+ nodes.draft.oninput();
+ assert.equal(nodes.draft.value,'[Проход 1 из 2: Колян]\nдело');
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян','Жека']);
+ assert.match(nodes['pass-hint'].textContent,/Для прохода 2 \(Жека\) в тексте нет пункта\. Он получит всё сообщение без своего задания\./);
+ assert.equal(nodes.send.disabled,false);
+ nodes.composer.onsubmit({preventDefault(){}});
+ assert.equal(requests('send').length,1);
+ assert.equal(requests('send')[0].text,'[Проход 1 из 2: Колян]\nдело');
+ assert.deepEqual(Array.from(requests('send')[0].responseOrder),['claude','codex']);
+});
+
+test('markers fill an empty chip row, and another chip appends its mark',()=>{
+ const {nodes,publish}=webview();
+ enableAll(publish);
+ nodes.draft.value='[Проход 1 из 2: Жека]\nа\n[Проход 2 из 2: Гриха]\nб';
+ nodes.draft.oninput();
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Жека','Гриха']);
+ assert.equal(nodes['pass-hint'].hidden,true);
+ nodes['response-order'].children[0].onclick();
+ assert.equal(nodes.draft.value,'[Проход 1 из 3: Жека]\nа\n[Проход 2 из 3: Гриха]\nб\n\n[Проход 3 из 3: Колян]\n');
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Жека','Гриха','Колян']);
+ nodes.draft.value='[Проход 1 из 2: Жека]\nа\n[Проход 2 из 2: Колян]\nб';
+ nodes.draft.oninput();
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Жека','Гриха','Колян']);
+ assert.equal(nodes.draft.value,'[Проход 1 из 2: Жека]\nа\n[Проход 2 из 2: Колян]\nб');
+ assert.match(nodes['pass-hint'].textContent,/Проход 2 в тексте — Колян, а на плашке — Гриха\./);
+});
+
+test('a switched-off agent is rewritten onto the others, including from a snippet',()=>{
+ const {nodes,publish}=webview();
+ const state=enableAll(publish);
+ nodes.draft.value='[Проход 1 из 3: Гриха]\nа\n[Проход 2 из 3: Колян]\nб\n[Проход 3 из 3: Гриха]\nв';
+ nodes.draft.oninput();
+ state.agents.find(a=>a.id==='grok').enabled=false;
+ publish(state);
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян']);
+ assert.equal(nodes.draft.value,'[Проход 1 из 3: Колян]\nа\n[Проход 2 из 3: ?]\nб\n[Проход 3 из 3: ?]\nв');
+ assert.match(nodes['pass-hint'].textContent,/Гриха выключен, его проходы 1 и 3 переписаны на Колян и \?\./);
+ const {fresh}=require('../dist/shared/model');
+ const next=fresh();
+ publish(next,undefined,false,[],undefined,undefined,undefined,[
+  {id:'s9',name:'ходы',text:'[Проход 1 из 2: Гриха]\nа\n[Проход 2 из 2: Колян]\nб',flags:{responseOrder:['grok','claude']}}
+ ]);
+ nodes['snippets-toggle'].onclick();
+ nodes['snippets-list'].querySelector('.snippet-name').onclick();
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян']);
+ assert.equal(nodes.draft.value,'[Проход 1 из 2: Колян]\nа\n[Проход 2 из 2: ?]\nб');
+ assert.match(nodes['pass-hint'].textContent,/Гриха выключен, его проход 1 переписан на Колян\./);
+});
+
+test('opening a draft fills chips only when the row is empty',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,publish}=webview();
+ const state=fresh();
+ state.agents.forEach(a=>{a.enabled=true;});
+ state.draft='[Проход 1 из 2: Жека]\nа\n[Проход 2 из 2: Гриха]\nб';
+ publish(state);
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Жека','Гриха']);
+ assert.equal(nodes.draft.value,state.draft);
+ assert.equal(nodes['pass-hint'].hidden,true);
+ const other=fresh();
+ other.agents.forEach(a=>{a.enabled=true;});
+ other.draft='[Проход 1 из 2: Жека]\nа';
+ other.responseOrder=['claude'];
+ publish(other);
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян']);
+ assert.equal(nodes.draft.value,'[Проход 1 из 2: Жека]\nа');
+ assert.match(nodes['pass-hint'].textContent,/Проход 1 в тексте — Жека, а на плашке — Колян\./);
+});
+
+test('a name at the start without chips warns when markers name other agents',()=>{
+ const {nodes,publish}=webview();
+ enableAll(publish);
+ nodes.draft.value='Колян\n[Проход 1 из 2: Жека]\nа\n[Проход 2 из 2: Гриха]\nб';
+ nodes.draft.oninput();
+ assert.equal(nodes['order-strip'].hidden,true);
+ assert.equal(nodes['pass-hint'].textContent,'Ответит только Колян. В тексте есть проходы других участников, а плашек нет.');
+ assert.equal(nodes.send.disabled,false);
+ nodes.draft.value='Колян, смотри\n[Проход 1 из 2: Колян]\nа\n[Проход 2 из 2: Колян]\nб';
+ nodes.draft.oninput();
+ assert.equal(nodes['pass-hint'].hidden,true);
+ assert.equal(nodes['order-strip'].hidden,true);
+ nodes.draft.value='Жека\n[Проход 1 из 2: Колян]\nа';
+ nodes.draft.oninput();
+ assert.match(nodes['pass-hint'].textContent,/Ответит только Жека/);
+});
+
+test('a marker uses the chip of its own pass number, not its place in the text',()=>{
+ const {nodes,publish}=webview();
+ enableAll(publish);
+ nodes['response-order'].children[0].onclick();
+ nodes['response-order'].children[1].onclick();
+ nodes['response-order'].children[2].onclick();
+ nodes.draft.value='[Проход 1 из 3: Гриха]\nа\n[Проход 3 из 3: Колян]\nб';
+ nodes.draft.oninput();
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян','Жека','Гриха']);
+ assert.equal(nodes.draft.value,'[Проход 1 из 3: Гриха]\nа\n[Проход 3 из 3: Колян]\nб');
+ const hint=nodes['pass-hint'].textContent;
+ assert.match(hint,/Проход 1 в тексте — Гриха, а на плашке — Колян\./);
+ assert.match(hint,/Проход 3 в тексте — Колян, а на плашке — Гриха\./);
+ assert.match(hint,/Для прохода 2 \(Жека\) в тексте нет пункта\. Он получит всё сообщение без своего задания\./);
+ assert.doesNotMatch(hint,/на плашке — Жека/);
+ const first=chips(nodes)[0];
+ first.ondragstart({dataTransfer:{setData(){},effectAllowed:''}});
+ chips(nodes)[2].ondrop({preventDefault(){},stopPropagation(){}});
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Жека','Гриха','Колян']);
+ assert.equal(nodes.draft.value,'[Проход 1 из 3: Жека]\nа\n[Проход 3 из 3: Колян]\nб');
+ assert.match(nodes['pass-hint'].textContent,/Для прохода 2 \(Гриха\) в тексте нет пункта/);
+ assert.doesNotMatch(nodes['pass-hint'].textContent,/Проход 3 в тексте/);
+});
+
+test('a queued edit checks a pass number against that place in the chain',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,requests,publish}=webview();
+ const state=fresh();
+ state.messages=[{id:'q',author:'Антон',text:'старое',turn:'a'}];
+ state.turns=[
+  {id:'a',messageId:'q',recipient:'claude',status:'proposed',pass:1},
+  {id:'c',messageId:'q',recipient:'grok',status:'proposed',pass:3}
+ ];
+ state.queue=['a','c'];
+ publish(state);
+ let card=nodes.queued.children[0];
+ card.querySelector('.queue-tools').children[0].onclick();
+ card=nodes.queued.children[0];
+ const box=card.querySelector('.queue-edit');
+ box.value='[Проход 3 из 3: Колян]\nдело';
+ box.oninput();
+ card.querySelector('.queue-tools').children[0].onclick();
+ assert.equal(requests('queue-edit')[0].text,'[Проход 3 из 3: Колян]\nдело');
+ card=nodes.queued.children[0];
+ const hint=card.querySelector('.queue-pass-hint');
+ assert.match(hint.textContent,/Проход 3 в тексте — Колян, а в цепочке — Гриха\./);
+ assert.doesNotMatch(hint.textContent,/в цепочке — Жека/);
+ assert.match(hint.textContent,/Для прохода 1 \(Колян\) в тексте нет пункта/);
+ assert.doesNotMatch(hint.textContent,/Кто будет выполнять проход 3/);
+});
+
+test('applying a queued edit warns against the frozen chain and still posts',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,requests,publish}=webview();
+ const state=fresh();
+ state.messages=[{id:'q',author:'Антон',text:'старое',turn:'a'}];
+ state.turns=[
+  {id:'b',messageId:'q',recipient:'codex',status:'proposed',pass:2},
+  {id:'a',messageId:'q',recipient:'claude',status:'proposed',pass:1}
+ ];
+ state.queue=['a','b'];
+ publish(state);
+ let card=nodes.queued.children[0];
+ card.querySelector('.queue-tools').children[0].onclick();
+ card=nodes.queued.children[0];
+ const box=card.querySelector('.queue-edit');
+ box.value='[Проход 1 из 2: Гриха]\nдело';
+ box.oninput();
+ card.querySelector('.queue-tools').children[0].onclick();
+ assert.equal(requests('queue-edit')[0].text,'[Проход 1 из 2: Гриха]\nдело');
+ card=nodes.queued.children[0];
+ const hint=card.querySelector('.queue-pass-hint');
+ assert.match(hint.textContent,/Проход 1 в тексте — Гриха, а в цепочке — Колян\./);
+ assert.match(hint.textContent,/Для прохода 2 \(Жека\) в тексте нет пункта\. Он получит всё сообщение без своего задания\./);
+ assert.equal(card.querySelector('.queue-edit').value,'[Проход 1 из 2: Гриха]\nдело');
+});
+test('a second chip writes marks under the text, and an empty tail comes off with the chip',()=>{
+ const {nodes,publish}=webview();
+ enableAll(publish);
+ nodes.draft.value='общие указания';
+ nodes.draft.oninput();
+ nodes['response-order'].children[0].onclick();
+ assert.equal(nodes.draft.value,'общие указания');
+ nodes['response-order'].children[2].onclick();
+ assert.equal(nodes.draft.value,'общие указания\n\n[Проход 1 из 2: Колян]\n\n[Проход 2 из 2: Гриха]\n');
+ nodes['response-order'].children[1].onclick();
+ assert.equal(nodes.draft.value,'общие указания\n\n[Проход 1 из 3: Колян]\n\n[Проход 2 из 3: Гриха]\n\n[Проход 3 из 3: Жека]\n');
+ chips(nodes)[2].querySelector('.order-step-x').onclick();
+ assert.equal(nodes.draft.value,'общие указания\n\n[Проход 1 из 2: Колян]\n\n[Проход 2 из 2: Гриха]\n');
+ chips(nodes)[1].querySelector('.order-step-x').onclick();
+ assert.equal(nodes.draft.value,'общие указания');
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян']);
+ assert.equal(nodes['pass-hint'].hidden,true);
+});
+test('typing does not insert or rewrite pass marks',()=>{
+ const {nodes,publish}=webview();
+ enableAll(publish);
+ nodes.draft.value='общие указания';
+ nodes.draft.oninput();
+ nodes['response-order'].children[0].onclick();
+ nodes['response-order'].children[1].onclick();
+ const marked=nodes.draft.value;
+ assert.match(marked,/\[Проход 1 из 2: Колян\]/);
+ const typed=marked.replace('[Проход 1 из 2: Колян]','[Проход 1 из 2: Жека]');
+ nodes.draft.value=typed;
+ nodes.draft.oninput();
+ assert.equal(nodes.draft.value,typed);
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян','Жека']);
+ assert.match(nodes['pass-hint'].textContent,/Проход 1 в тексте — Жека, а на плашке — Колян\./);
+});
+test('a chip after a skipped pass adds marks only up to the chip count',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,publish}=webview();
+ const state=fresh();
+ state.agents.forEach(a=>{a.enabled=true;});
+ publish(state,undefined,false,[],undefined,undefined,undefined,undefined,{maxResponders:10});
+ nodes['response-order'].children[0].onclick();
+ nodes['response-order'].children[1].onclick();
+ nodes['response-order'].children[2].onclick();
+ nodes.draft.value='[Проход 1 из 3: Колян]\nа\n[Проход 3 из 3: Гриха]\nб';
+ nodes.draft.oninput();
+ nodes['response-order'].children[0].onclick();
+ assert.equal(nodes.draft.value,'[Проход 1 из 4: Колян]\nа\n[Проход 3 из 4: Гриха]\nб\n\n[Проход 4 из 4: Колян]\n');
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян','Жека','Гриха','Колян']);
+ assert.doesNotMatch(nodes.draft.value,/Проход 5/);
+ assert.match(nodes['pass-hint'].textContent,/Для прохода 2 \(Жека\) в тексте нет пункта/);
+});
+test('a snippet with a saved order does not insert pass marks',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,publish}=webview();
+ const state=fresh();
+ state.agents.forEach(a=>{a.enabled=true;});
+ publish(state,undefined,false,[],undefined,undefined,undefined,[
+  {id:'s1',name:'план',text:'общие указания',flags:{responseOrder:['claude','grok']}}
+ ]);
+ nodes['snippets-toggle'].onclick();
+ nodes['snippets-list'].querySelector('.snippet-name').onclick();
+ assert.equal(nodes.draft.value,'общие указания');
+ assert.deepEqual(chips(nodes).map(s=>s.querySelector('.order-step-main').textContent),['Колян','Гриха']);
+ assert.equal(nodes['pass-hint'].hidden,true);
 });
 
 test('current question approval is separated from an older pending question',()=>{
@@ -274,17 +663,114 @@ test('current question approval is separated from an older pending question',()=
    {id:'first',messageId:'m',recipient:'claude',executor:'claude',status:'completed',replyId:'r'},
    {id:'second',messageId:'m',recipient:'codex',status:'proposed',cycle:2}];state.queue=['older','second'];
  publish(state);
- assert.equal(nodes['older-queue'].hidden,false);
- assert.equal(nodes['older-rows'].children.length,1);
- assert.equal(nodes.queued.children.length,1);
- assert.match(nodes.queued.children[0].children[0].children[1].textContent,/Old question/);
- assert.match(nodes['older-rows'].children[0].children[0].children[1].textContent,/Current question/);
- assert.match(nodes['older-rows'].children[0].children[0].children[2].textContent,/цикл 2/);
- const actions=nodes['older-rows'].children[0].children[1];
- assert.match(actions.children[1].textContent,/Жека/);
- actions.children[1].onclick();
+ // Every question gets its own card, in queue order.
+ assert.equal(nodes.queued.children.length,2);
+ const [older,current]=nodes.queued.children;
+ assert.equal(older.querySelector('.queue-text').textContent,'Old question');
+ assert.equal(current.querySelector('.queue-text').textContent,'Current question');
+ assert.match(current.querySelector('.cycle-badge').textContent,/цикл 2/);
+ const plates=collect(current,'queue-step');
+ assert.deepEqual(plates.map(p=>p.children[0].textContent),['Колян ✓','Жека']);
+ plates[1].children[0].onclick();
  assert.equal(requests('handoff')[0].turnId,'second');
  assert.equal(requests('handoff')[0].text,undefined);
+ // Колян already answered, so the second question can be neither edited nor dragged.
+ assert.equal(current.draggable,false);
+ assert.deepEqual(current.querySelector('.queue-tools').children.map(b=>b.textContent),['Удалить']);
+ assert.equal(older.draggable,true);
+ assert.deepEqual(older.querySelector('.queue-tools').children.map(b=>b.textContent),['Редактировать','Удалить']);
+});
+test('a queued question is edited in place, removed, and its steps dropped one by one',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,requests,respond,publish}=webview();const state=fresh();
+ state.messages=[{id:'q',author:'Антон',text:'Сделай и проверь',turn:'a'}];
+ state.turns=[{id:'a',messageId:'q',recipient:'codex',status:'proposed'},{id:'b',messageId:'q',recipient:'claude',status:'proposed'}];
+ state.queue=['a','b'];
+ publish(state);
+ let card=nodes.queued.children[0];
+ const plates=collect(card,'queue-step');
+ assert.deepEqual(plates.map(p=>p.children[0].textContent),['Жека','Колян']);
+ assert.match(plates[0].className,/\bnext\b/,'the head of the queue blinks');
+ assert.doesNotMatch(plates[1].className,/\bnext\b|\bready\b/);
+ plates[1].children[1].onclick();
+ assert.equal(requests('discard')[0].turnId,'b');
+ card.querySelector('.queue-tools').children[0].onclick();
+ card=nodes.queued.children[0];
+ const box=card.querySelector('.queue-edit');
+ assert.equal(box.value,'Сделай и проверь');
+ assert.equal(card.draggable,false,'a card being edited does not drag');
+ box.value='Сделай, потом проверь';box.oninput();
+ const apply=card.querySelector('.queue-tools').children[0];
+ assert.equal(apply.textContent,'Применить');
+ apply.onclick();
+ assert.deepEqual({id:requests('queue-edit')[0].messageId,text:requests('queue-edit')[0].text},{id:'q',text:'Сделай, потом проверь'});
+ respond(requests('queue-edit')[0]);
+ card=nodes.queued.children[0];
+ assert.equal(card.querySelector('.queue-edit'),null);
+ card.querySelector('.queue-tools').children[1].onclick();
+ assert.equal(requests('queue-remove')[0].messageId,'q');
+});
+test('pause waits for the running agent, then offers Продолжить; sending in a pause goes out of turn',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,requests,publish}=webview();const state=fresh();
+ state.autoReply=true;
+ state.messages=[{id:'q',author:'Антон',text:'первый',turn:'a'},{id:'r',author:'Антон',text:'второй',turn:'c'}];
+ state.turns=[{id:'a',messageId:'q',recipient:'claude',executor:'claude',status:'running'},
+  {id:'c',messageId:'r',recipient:'codex',status:'proposed'}];
+ state.queue=['c'];
+ publish(state,{provider:'claude',turnId:'a'});
+ assert.equal(nodes.pause.textContent,'Пауза');
+ assert.match(nodes.pause.title,/Учти, что это может сбить с толку заготовленную очередь, которая пойдёт после незапланированного вопроса/);
+ assert.equal(nodes.pause.disabled,false);
+ nodes.pause.onclick();
+ assert.equal(requests('pause')[0].on,true);
+ state.paused=true;
+ publish(state,{provider:'claude',turnId:'a'});
+ assert.equal(nodes.pause.textContent,'Отменить паузу');
+ assert.match(nodes['floor-title'].textContent,/затем пауза/);
+ nodes.pause.onclick();
+ assert.equal(requests('pause')[1].on,false);
+ state.turns[0].status='completed';
+ publish(state);
+ assert.equal(nodes.pause.textContent,'Продолжить');
+ assert.match(nodes.pause.title,/#2/);
+ assert.equal(nodes['floor-title'].textContent,'Пауза');
+ const plate=collect(nodes.queued,'queue-step')[0];
+ assert.equal(plate.children[0].tag,'span','no handoff during a pause');
+ assert.equal(nodes['pause-hint'].hidden,false);
+ assert.equal(nodes.send.textContent,'Отправить вне очереди');
+ nodes.pause.onclick();
+ assert.equal(requests('pause')[2].on,false);
+ // Without a pause, a queue that stopped under Авто offers the same Продолжить.
+ state.paused=false;
+ publish(state);
+ assert.equal(nodes.pause.textContent,'Продолжить');
+ assert.equal(nodes['pause-hint'].hidden,true);
+ state.autoReply=false;
+ publish(state);
+ assert.equal(nodes.pause.textContent,'Пауза');
+ assert.match(nodes.pause.title,/Учти, что это может сбить с толку заготовленную очередь, которая пойдёт после незапланированного вопроса/);
+});
+test('agents fold from their heading or the queue heading, and the queue stays open',()=>{
+ const {nodes,requests}=webview();
+ nodes['agents-fold'].onclick();
+ assert.equal(nodes.agents.hidden,true);
+ assert.match(nodes['agents-block'].className,/\bfolded\b/);
+ assert.equal(nodes['agents-fold'].attributes['aria-expanded'],'false');
+ assert.equal(nodes['queue-fold'].attributes['aria-expanded'],'false');
+ assert.equal(requests('layout').at(-1).agentsFolded,true);
+ assert.equal(nodes['queue-body'].hidden,false);
+ assert.doesNotMatch(nodes['queue-block'].className,/\bfolded\b/);
+ nodes['agents-fold'].onclick();
+ assert.equal(nodes.agents.hidden,false);
+ assert.equal(requests('layout').at(-1).agentsFolded,false);
+ nodes['queue-fold'].onclick();
+ assert.equal(nodes.agents.hidden,true);
+ assert.equal(nodes['queue-body'].hidden,false);
+ assert.equal(requests('layout').at(-1).agentsFolded,true);
+ nodes['queue-fold'].onclick();
+ assert.equal(nodes.agents.hidden,false);
+ assert.equal(requests('layout').at(-1).agentsFolded,false);
 });
 
 test('detached panel hides move control and context generation clears old draft and attachments',()=>{
@@ -877,23 +1363,29 @@ test('a queued turn under auto-reply while busy says it will go by itself',()=>{
   {id:'t2',messageId:'q',recipient:'codex',status:'proposed'}];
  state.queue=['t2'];
  publish(state,{provider:'claude',turnId:'t1'});
- const actions=nodes.queued.querySelector('.queue-actions');
- assert.match(actions.children[1].textContent,/пойдёт сам/);
- assert.ok(!String(actions.children[1].className).includes('next'));
+ const plates=collect(nodes.queued,'queue-step');
+ assert.deepEqual(plates.map(p=>p.children[0].textContent),['Колян…','Жека']);
+ assert.match(plates[1].children[0].title,/пойдёт сам/);
+ assert.ok(!String(plates[1].className).includes('next'));
 });
-test('three queue replies fit as short name buttons',()=>{
+test('three queue replies fit as short name plates',()=>{
  const {fresh}=require('../dist/shared/model');
- const {nodes,publish}=webview();
+ const {nodes,publish,requests}=webview();
  const state=fresh();
  state.agents.forEach(a=>{a.enabled=true;});
  state.messages=[{id:'q',author:'Антон',text:'всем троим',turn:'t'}];
  state.turns=[{id:'t',messageId:'q',recipient:'all',status:'proposed'}];
  state.queue=['t'];
  publish(state);
- const actions=nodes.queued.querySelector('.queue-actions');
- const answers=(actions.children||[]).filter(c=>c.tag==='button'&&!String(c.className).includes('cancel'));
+ const answers=collect(nodes.queued,'queue-step').map(p=>p.children[0]);
  assert.equal(answers.length,3);
- assert.deepEqual(answers.map(b=>b.textContent),['Колян\nответить','Жека\nответить','Гриха\nответить']);
+ assert.deepEqual(answers.map(b=>b.textContent),['Колян','Жека','Гриха']);
+ assert.ok(answers.every(b=>b.tag==='span' && b.attributes.role==='button'));
+ let prevented=false;
+ answers[0].onkeydown({key:'Enter',preventDefault(){prevented=true;}});
+ assert.equal(prevented,true);
+ assert.equal(requests('handoff')[0].provider,'claude');
+ assert.equal(requests('handoff')[0].turnId,'t');
  assert.equal(nodes['queue-empty'].hidden,true);
 });
 test('plugin settings are grouped so grokPath sits with the other CLI paths',()=>{
@@ -910,6 +1402,13 @@ test('plugin settings are grouped so grokPath sits with the other CLI paths',()=
  assert.equal(sections[1].properties['trio.grokSessionMaxTokens'].default,0);
  assert.equal(sections[3].properties['trio.sessionIdleMinutes'].default,55);
  assert.equal(sections[3].properties['trio.sessionMaxTokens'],undefined);
+ const cap=sections[3].properties['trio.maxResponders'];
+ assert.equal(cap.type,'integer');
+ assert.equal(cap.default,3);
+ assert.equal(cap.minimum,1);
+ assert.equal(cap.maximum,10);
+ assert.equal(cap.order,6);
+ assert.match(cap.markdownDescription,/повтор агента считается заново/);
  const feed=sections[2].properties['trio.feedMaxMessages'];
  assert.equal(feed.default,1000);
  assert.equal(feed.minimum,1);
@@ -959,14 +1458,14 @@ test('a fat delta is shown next to send before the turn starts',()=>{
  assert.match(nodes['delta-hint'].textContent,/58 из 189/);
  assert.doesNotMatch(nodes['delta-hint'].textContent,/Жека/);
  assert.match(nodes['delta-hint'].className,/\bwarn\b/);
- nodes['response-order'].children[0].onclick();
+ nodes['order-strip'].querySelector('.order-step-x').onclick();
  assert.equal(nodes['delta-hint'].hidden,true);
  nodes['response-order'].children[1].onclick();
  assert.equal(nodes['delta-hint'].hidden,false);
  assert.match(nodes['delta-hint'].textContent,/Жека/);
  assert.match(nodes['delta-hint'].textContent,/первый ход \/ после сброса/);
  assert.doesNotMatch(nodes['delta-hint'].textContent,/Колян/);
- nodes['response-order'].children[1].onclick();
+ nodes['order-strip'].querySelector('.order-step-x').onclick();
  publish(state,undefined,false,[],undefined,undefined,[
   {provider:'claude',chars:62351,messages:58,total:189,kind:'full',reason:'compact'}
  ]);
@@ -1214,6 +1713,90 @@ test('panel swap and keyboard resize persist without starting an agent',()=>{
  assert.equal(requests('send').length,0);
  assert.equal(requests('handoff').length,0);
 });
+test('the line above the draft grows only the field and a double click restores it',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,requests,publish}=webview();
+ const line=nodes['composer-divider'];
+ const key=name=>line.onkeydown({key:name,preventDefault(){}});
+ assert.equal(nodes.draft.style.height,'88px');
+ assert.equal(line.attributes['aria-valuenow'],'88');
+ const before=requests('layout').length;
+ line.onpointerdown({button:2,pointerId:1,clientY:0,preventDefault(){}});
+ line.onpointermove({clientY:-40});
+ assert.equal(requests('layout').length,before);
+ assert.equal(nodes.draft.style.height,'88px');
+ line.onpointerdown({button:0,pointerId:1,clientY:100,preventDefault(){}});
+ assert.equal(nodes.layout.classList.contains('composer-resizing'),true);
+ line.onpointermove({clientY:60});
+ assert.equal(nodes.draft.style.height,'128px');
+ line.onpointerup({});
+ assert.equal(nodes.layout.classList.contains('composer-resizing'),false);
+ assert.equal(requests('layout').at(-1).draftHeight,128);
+ key('ArrowUp');
+ assert.equal(requests('layout').at(-1).draftHeight,148);
+ key('ArrowDown');
+ key('ArrowDown');
+ key('ArrowDown');
+ key('ArrowDown');
+ assert.equal(requests('layout').at(-1).draftHeight,68);
+ key('ArrowDown');
+ assert.equal(requests('layout').at(-1).draftHeight,64);
+ key('ArrowDown');
+ assert.equal(requests('layout').at(-1).draftHeight,64);
+ key('ArrowLeft');
+ assert.equal(requests('layout').at(-1).draftHeight,64);
+ line.ondblclick();
+ assert.equal(requests('layout').at(-1).draftHeight,88);
+ assert.equal(nodes.draft.style.height,'88px');
+ publish(fresh(),undefined,false,[],undefined,undefined,undefined,undefined,{layout:{side:'left',width:400,draftHeight:160.4}});
+ assert.equal(nodes.draft.style.height,'160px');
+ assert.equal(line.attributes['aria-valuenow'],'160');
+ nodes['swap-panels'].onclick();
+ assert.equal(requests('layout').at(-1).side,'right');
+ assert.equal(requests('layout').at(-1).draftHeight,160);
+ assert.equal(requests('send').length,0);
+ assert.equal(requests('handoff').length,0);
+});
+test('attachments refit the draft, typing does not measure, and a short pane keeps the saved height',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,requests,respond,publish}=webview();
+ const css=fs.readFileSync('webview/main.css','utf8');
+ assert.match(css,/\.composer\{[^}]*max-height:var\(--composer-cap,calc\(100% - 80px\)\)[^}]*overflow:auto/);
+ assert.match(css,/\.chat-pane\{[^}]*overflow:hidden/);
+ let paneH=500, measures=0;
+ const rect=height=>({left:0,top:0,right:0,bottom:0,width:0,height});
+ for (const [node,height] of [
+  [nodes['chat-pane'],()=>paneH],
+  [nodes.draft,()=>parseFloat(nodes.draft.style.height)||0],
+  [nodes['composer-divider'],()=>8]
+ ]) node.getBoundingClientRect=()=>{measures++;return rect(height());};
+ Object.defineProperty(nodes.composer,'scrollHeight',{configurable:true,get(){
+  return (parseFloat(nodes.draft.style.height)||0)+150+nodes.attachments.children.length*40;
+ }});
+ const caps=[];
+ nodes['chat-pane'].style.setProperty=(name,value)=>{if(name==='--composer-cap')caps.push(value);};
+ publish(fresh(),undefined,false,[],undefined,undefined,undefined,undefined,{layout:{side:'right',width:400,draftHeight:270}});
+ assert.equal(nodes.draft.style.height,'270px');
+ measures=0; caps.length=0;
+ nodes.draft.oninput();
+ assert.equal(measures,0,'a letter does not measure the pane');
+ assert.equal(caps.length,0);
+ assert.equal(nodes.draft.style.height,'270px');
+ paneH=200;
+ nodes.attach.onclick();
+ respond(requests('attach').at(-1),{attachment:{id:'a',label:'f.ts',text:'code'}});
+ assert.equal(nodes.draft.style.height,'64px');
+ assert.equal(caps.at(-1),'120px');
+ assert.equal(measures,3);
+ paneH=500;
+ measures=0;
+ nodes.attachments.children[0].children[1].onclick();
+ assert.equal(nodes.draft.style.height,'270px');
+ assert.equal(caps.at(-1),'420px');
+ assert.equal(measures,3);
+ assert.equal(requests('send').length,0);
+ assert.equal(requests('handoff').length,0);
+});
 
 test('a question card does not duplicate its turn trace or token stamp',()=>{
  const {fresh}=require('../dist/shared/model');
@@ -1253,7 +1836,7 @@ test('snippet helpers insert at the caret, filter, reorder and drop junk',()=>{
  assert.equal(flagsActive({autoEdits:false,responseOrder:[]}),false);
  assert.match(flagsHint({autoCommands:true,responseOrder:['codex']}),/\+команды/);
  assert.match(flagsHint({autoCommands:true,responseOrder:['codex']}),/Жека/);
- assert.deepEqual(captureFlags({autoCommands:true,responseOrder:['codex','codex']}).responseOrder,['codex']);
+ assert.deepEqual(captureFlags({autoCommands:true,responseOrder:['codex','codex']}).responseOrder,['codex','codex']);
  assert.equal(snippetLimits.count,40);
  assert.deepEqual(snippetCreateSource('из поля','поиск'),{text:'из поля',name:''});
  assert.deepEqual(snippetCreateSource('','проанализируй'),{text:'проанализируй',name:'проанализируй'});
@@ -1484,7 +2067,8 @@ test('a snippet with remembered flags restores discuss and order',()=>{
  nodes['snippets-list'].querySelector('.snippet-name').onclick();
  assert.equal(nodes.draft.value,'оцените');
  assert.equal(nodes.discuss.classList.contains('selected'),true);
- assert.deepEqual(nodes['response-order'].children.map(b=>b.textContent),['2 Колян','1 Жека']);
+ assert.deepEqual(nodes['response-order'].children.map(b=>b.textContent),['Колян','Жека']);
+ assert.deepEqual(nodes['order-strip'].children.filter(s=>!s.classList.contains('order-clear')).map(s=>s.querySelector('.order-step-main').textContent),['Жека','Колян']);
 });
 
 test('snippet filter hides non-matching rows and pencil opens the editor',()=>{
@@ -1628,14 +2212,37 @@ test('new conversation asks who writes the summary and can store the current cou
  publish(state);
  assert.equal(nodes.send.disabled,true);
  assert.equal(nodes['new-conversation'].disabled,true);
- const actions=nodes.queued.querySelector('.queue-actions');
- assert.deepEqual(actions.children.map(n=>n.textContent),['сводка следом','Снять']);
+ const card=nodes.queued.children[0];
+ assert.deepEqual(collect(card,'queue-step').map(p=>p.children[0].textContent),['Сводка']);
+ assert.deepEqual(card.querySelector('.queue-tools').children.map(n=>n.textContent),['Удалить']);
  // Stored as Anton's for the numbering, but signed by Trio in the feed.
  const task=nodes.feed.children.find(n=>n.dataset?.messageId==='a');
  assert.equal(task.querySelector('.message-head strong').textContent,'Trio · кнопка «Новый»');
  assert.match(task.className,/\bsystem\b/);
 });
 
+
+test('new conversation warns about a waiting queue and hides the line when the queue is empty',()=>{
+ const {fresh}=require('../dist/shared/model');
+ const {nodes,publish}=webview();
+ const state=fresh();
+ publish(state);
+ nodes['new-conversation'].onclick();
+ assert.equal(nodes['fresh-dialog'].open,true);
+ assert.equal(nodes['fresh-queue'].hidden,true);
+ state.messages.push({id:'q',author:'Антон',text:'сделай',turn:'t'});
+ state.turns.push({id:'t',messageId:'q',recipient:'claude',status:'proposed'});
+ state.queue=['t'];
+ publish(state);
+ assert.equal(nodes['fresh-queue'].hidden,false);
+ state.queue=[];
+ publish(state);
+ assert.equal(nodes['fresh-queue'].hidden,true);
+ state.turns.push({id:'s',messageId:'q',recipient:'claude',status:'proposed',summary:true});
+ state.queue=['s'];
+ publish(state);
+ assert.equal(nodes['fresh-queue'].hidden,true,'a queued summary is not a waiting question');
+});
 
 test('compaction disables new conversation including a dialog that is already open',()=>{
  const {nodes,publish,requests}=webview();

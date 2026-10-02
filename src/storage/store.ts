@@ -1,6 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { State, Catalogs, fresh, input, providers, id, validAttachments, normalizeInstruction, summaryFeed, summaryFile, privilegeIds } from '../shared/model';
+import { State, Catalogs, fresh, input, providers, id, validAttachments, normalizeInstruction, summaryFeed, summaryFile, privilegeIds, privilegeJournalFile, PrivilegeJournalRow, isProvider } from '../shared/model';
 
 export function shortError(e: unknown): string {
  const raw = String(e);
@@ -91,7 +91,8 @@ export class Store {
   if (s.conversationId === undefined) s.conversationId = id();
   if (s.draftAttachments === undefined) s.draftAttachments = [];
   if (!validAttachments(s.draftAttachments) || s.messages.some((m:any) => m.attachments !== undefined && !validAttachments(m.attachments))) throw new Error('Неверные вложения');
-  if (s.responseOrder === undefined) s.responseOrder = [];
+  if (!Array.isArray(s.responseOrder)) s.responseOrder = [];
+  else s.responseOrder = s.responseOrder.filter((p: unknown) => isProvider(p)).slice(0, 10);
   if (typeof s.conversationId !== 'string' || !input({type:'draft',text:s.draft,recipient:s.recipient,responseOrder:s.responseOrder})) throw new Error('Неверный порядок ответов');
   if (s.version < 3 && s.contextStart !== undefined && (typeof s.contextStart !== 'string' || !s.messages.some((m:any)=>m.id===s.contextStart))) throw new Error('Неверная граница контекста');
   // Engine-reported occupancy is a cache, not history: anything unreadable is dropped, never fatal.
@@ -106,12 +107,14 @@ export class Store {
   s.autoReply = s.autoReply === true;
   s.autoEdits = s.autoEdits === true || s.autoActions === true;
   s.autoCommands = s.autoCommands === true;
+  s.paused = s.paused === true;
   s.privileges = privilegeIds.filter(id => Array.isArray(s.privileges) && s.privileges.includes(id));
   s.privilegeOn = s.privilegeOn === true && s.privileges.length > 0;
   for (const t of s.turns) {
     if (typeof t.startedAt !== 'number' || !Number.isFinite(t.startedAt)) delete t.startedAt;
     if (typeof t.endedAt !== 'number' || !Number.isFinite(t.endedAt)) delete t.endedAt;
     if (typeof t.cycle !== 'number' || !Number.isFinite(t.cycle) || t.cycle < 1) delete t.cycle;
+    if (typeof t.pass !== 'number' || !Number.isInteger(t.pass) || t.pass < 1 || t.pass > 10) delete t.pass;
     if (t.summary !== true) delete t.summary;
     const instruction = normalizeInstruction(t.instruction);
     if (instruction) t.instruction = instruction;
@@ -143,6 +146,27 @@ export class Store {
  async summarySource(state: State, root: string, git = ''): Promise<string> {
   const file = path.join(root, summaryFile);
   await writeAtomic(file, summaryFeed(state, git));
+  return file;
+ }
+ // Append-only. A missing trailing newline is repaired so the next object stays on its own line.
+ async appendPrivilegeJournal(root: string, rows: PrivilegeJournalRow[]): Promise<string> {
+  const file = path.join(root, privilegeJournalFile);
+  let lead = '';
+  try {
+   const handle = await fs.open(file, 'r');
+   try {
+    const stat = await handle.stat();
+    if (stat.size > 0) {
+     const buf = Buffer.alloc(1);
+     await handle.read(buf, 0, 1, stat.size - 1);
+     if (buf[0] !== 10) lead = '\n';
+    }
+   } finally {await handle.close();}
+  } catch (e) {
+   if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+  }
+  const body = lead + rows.map(row => JSON.stringify(row)).join('\n') + '\n';
+  await fs.appendFile(file, body.replace(/\r\n?/g, '\n'), 'utf8');
   return file;
  }
  async dropSummarySource(root: string): Promise<void> {

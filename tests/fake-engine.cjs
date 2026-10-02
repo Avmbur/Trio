@@ -9,7 +9,7 @@ if(args[0]==='auth'){
     session:{totalTokens:183065,inputTokens:180000,outputTokens:3065,limit:500000},turns:[{totalTokens:183065}]}));
 }else{
  const rl=readline.createInterface({input:process.stdin});
- let promptId;
+ let promptId, engineCancel=false;
  rl.on('line',line=>{
   const v=JSON.parse(line);
   if(args[0]==='agent'){
@@ -28,8 +28,14 @@ if(args[0]==='auth'){
     case 'x.ai/billing':
      result({config:{creditUsagePercent:17,currentPeriod:{type:'USAGE_PERIOD_TYPE_FIVE_HOUR',end:'2026-09-14T16:00:00Z'}}});
      break;
-    case 'session/prompt':
+    case 'session/prompt': {
      promptId=v.id;
+     const promptText=JSON.stringify(v.params&&v.params.prompt||'');
+     if(promptText.includes('ENGINE_CANCEL_BARE')){
+      send({jsonrpc:'2.0',id:promptId,result:{stopReason:'cancelled'}});
+      break;
+     }
+     engineCancel=promptText.includes('ENGINE_CANCEL');
      send({jsonrpc:'2.0',method:'x.ai/session_notification',params:{sessionId:'grok-session',type:'auto_compact'}});
      send({jsonrpc:'2.0',method:'x.ai/session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'auto_compact_start'}}});
      send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'agent_thought_chunk',content:{type:'text',text:'Сначала сверю код.'}}}});
@@ -39,16 +45,22 @@ if(args[0]==='auth'){
       toolCall:{title:'fake-test',kind:'execute'},
       options:[{optionId:'yes',kind:'allow_once',name:'Allow'},{optionId:'no',kind:'reject_once',name:'Reject'}]}});
      break;
+    }
     default:
      if(v.id!=null&&v.id!=='approval')send({jsonrpc:'2.0',id:v.id,error:{code:-32601,message:'Method not found'}});
    }
    if(v.id==='approval'&&v.result){
-    const text=v.result.outcome?.optionId==='yes'?'готово':'отказ';
-    // Live order: the tool finishes, then the next stage of the answer begins.
-    send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'tool_call_update',toolCallId:'t2',title:'fake-test',status:'completed'}}});
-    send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:text.slice(0,2)}}}});
-    send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:text.slice(2)}}}});
-    send({jsonrpc:'2.0',id:promptId,result:{stopReason:'end_turn',_meta:{totalTokens:120000,usage:{totalTokens:545449,modelCalls:3}}}});
+    if(engineCancel){
+     engineCancel=false;
+     send({jsonrpc:'2.0',id:promptId,result:{stopReason:'cancelled'}});
+    }else{
+     const text=v.result.outcome?.optionId==='yes'?'готово':'отказ';
+     // Live order: the tool finishes, then the next stage of the answer begins.
+     send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'tool_call_update',toolCallId:'t2',title:'fake-test',status:'completed'}}});
+     send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:text.slice(0,2)}}}});
+     send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'grok-session',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:text.slice(2)}}}});
+     send({jsonrpc:'2.0',id:promptId,result:{stopReason:'end_turn',_meta:{totalTokens:120000,usage:{totalTokens:545449,modelCalls:3}}}});
+    }
    }
   }else if(args[0]==='app-server'){
    const result=x=>send({id:v.id,result:x});

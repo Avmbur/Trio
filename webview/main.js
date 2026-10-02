@@ -10,7 +10,9 @@
   const summaryAuthor = 'Trio · кнопка «Новый»';
   let snapshot, initialized = false, nextRequest = 0, sendPending = false, attaching = false, resetPending = false;
   let responseOrder = [], attachments = [], draftTimer, agentSignature = '', queueSignature = '';
-  let layout = {side: 'right', width: 400}, dragging = false;
+  let queueEditing = {messageId: '', text: ''}, queueEditBox, queueDrag = '', pauseWants = true;
+  let orderDrag = -1, droppedNote = '', suppressMarkSync = false, queuePassNotes = {};
+  let layout = {side: 'right', width: 400}, dragging = false, draftDragging = false;
   let snippets = [], editingSnippet = '', instructionAgent = '', draftCaret = {start: 0, end: 0}, snippetUndo = [];
   let searchMatches = [], searchIndex = -1, searchTerm = '', searchTimer, tickTimer;
   // Question number → message id for the render that is painting links. Rebuilt at each render.
@@ -341,28 +343,305 @@
       row.children[1].title = 'Убрать ' + a.label;
       return row;
     }));
+    fitComposer();
+  }
+  function responderCap() {
+    const n = snapshot?.maxResponders;
+    if (!Number.isInteger(n) || n < 1) return 3;
+    return Math.min(n, 10);
+  }
+  // Зеркало passMarks / syncPassMarks из src/shared/model.ts. Webview тот модуль не импортирует.
+  const passMarkRe = /^\[Проход ([1-9]|10) из ([1-9]|10): (Колян|Жека|Гриха|\?)\]$/;
+  const markProvider = {Колян: 'claude', Жека: 'codex', Гриха: 'grok'};
+  function passMarks(text) {
+    const marks = [];
+    String(text || '').split('\n').forEach((raw, line) => {
+      const match = raw.replace(/\r$/, '').match(passMarkRe);
+      if (match) marks.push({pass: Number(match[1]), total: Number(match[2]), name: match[3], line});
+    });
+    return marks;
+  }
+  function passSpan(marks, chips) {
+    const highest = marks.reduce((max, mark) => Math.max(max, mark.pass), 0);
+    return Math.max(marks.length, chips, highest);
+  }
+  function providersFromMarks(text) {
+    const slots = [];
+    for (const mark of passMarks(text)) if (markProvider[mark.name]) slots[mark.pass - 1] = markProvider[mark.name];
+    const order = [];
+    for (const provider of slots) {
+      if (!provider) break;
+      order.push(provider);
+    }
+    return order;
+  }
+  function passWho(order, pass) {
+    return order[pass - 1] ? names[order[pass - 1]] : '?';
+  }
+  function passMarkLine(pass, total, who) {
+    return '[Проход ' + pass + ' из ' + total + ': ' + who + ']';
+  }
+  function rewritePassLines(text, order) {
+    const marks = passMarks(text);
+    if (!marks.length) return text;
+    const total = Math.max(passSpan(marks, order.length), 1);
+    return String(text).split('\n').map(raw => {
+      const cr = raw.endsWith('\r');
+      const line = cr ? raw.slice(0, -1) : raw;
+      const match = line.match(passMarkRe);
+      if (!match) return raw;
+      const next = passMarkLine(Number(match[1]), total, passWho(order, Number(match[1])));
+      return cr ? next + '\r' : next;
+    }).join('\n');
+  }
+  function appendPassMarks(text, order, from, to) {
+    const blocks = [];
+    for (let pass = from; pass <= to; pass++) blocks.push(passMarkLine(pass, Math.max(order.length, to), passWho(order, pass)));
+    const skeleton = blocks.join('\n\n') + '\n';
+    const base = String(text || '').replace(/[ \t]+$/g, '').replace(/\n+$/g, '');
+    return base ? base + '\n\n' + skeleton : skeleton;
+  }
+  function passRegions(text) {
+    const lines = String(text || '').split('\n');
+    const marks = [];
+    lines.forEach((raw, line) => {
+      const match = raw.replace(/\r$/, '').match(passMarkRe);
+      if (match) marks.push({pass: Number(match[1]), line});
+    });
+    return {lines, marks};
+  }
+  function regionEmpty(lines, start, end) {
+    for (let i = start; i < end; i++) if (lines[i].replace(/\r$/, '').trim()) return false;
+    return true;
+  }
+  function stripTrailingEmptyMark(text, chips) {
+    let current = text;
+    while (true) {
+      const found = passRegions(current);
+      const last = found.marks[found.marks.length - 1];
+      if (!last || last.pass <= chips || !regionEmpty(found.lines, last.line + 1, found.lines.length)) break;
+      current = found.lines.slice(0, last.line).join('\n');
+    }
+    return current;
+  }
+  function markBodiesEmpty(text) {
+    const found = passRegions(text);
+    if (!found.marks.length) return false;
+    return found.marks.every((mark, index) => regionEmpty(found.lines, mark.line + 1, index + 1 < found.marks.length ? found.marks[index + 1].line : found.lines.length));
+  }
+  function removePassMarks(text) {
+    const found = passRegions(text);
+    if (!found.marks.length) return text;
+    return found.lines.slice(0, found.marks[0].line).join('\n').replace(/\n+$/g, '');
+  }
+  function syncPassMarks(text, order, kind) {
+    let body = String(text || '');
+    const marks = passMarks(body);
+    if (kind === 'add' && order.length >= 2 && !marks.length) body = appendPassMarks(body, order, 1, order.length);
+    else if (kind === 'add' && marks.length) {
+      const start = marks.reduce((max, mark) => Math.max(max, mark.pass), 0) + 1;
+      if (start <= order.length) body = appendPassMarks(body, order, start, order.length);
+    }
+    if (!passMarks(body).length) return body;
+    body = rewritePassLines(body, order);
+    if (kind === 'drop' && order.length) {
+      body = stripTrailingEmptyMark(body, order.length);
+      if (passMarks(body).length) body = rewritePassLines(body, order);
+      if (order.length < 2 && markBodiesEmpty(body)) body = removePassMarks(body);
+    }
+    return body;
+  }
+  function listRu(items) {
+    if (items.length <= 1) return items[0] || '';
+    if (items.length === 2) return items[0] + ' и ' + items[1];
+    return items.slice(0, -1).join(', ') + ' и ' + items[items.length - 1];
+  }
+  function droppedSentences(dropped, kept) {
+    const groups = new Map();
+    for (const item of dropped) {
+      if (!groups.has(item.provider)) groups.set(item.provider, []);
+      groups.get(item.provider).push(item.index);
+    }
+    const lines = [];
+    for (const [provider, indexes] of groups) {
+      const one = indexes.length === 1;
+      const onto = indexes.map(index => kept[index] ? names[kept[index]] : '?');
+      lines.push(names[provider] + ' выключен, его ' + (one ? 'проход ' : 'проходы ')
+        + listRu(indexes.map(index => String(index + 1)))
+        + (one ? ' переписан на ' : ' переписаны на ') + listRu(onto) + '.');
+    }
+    return lines.join('\n');
+  }
+  function draftAddressee() {
+    const named = ($('draft').value || '').trim().match(/^(?:@)?(колян|claude|жека|codex|гриха|grok)(?=[\s,:.!?]|$)/iu);
+    if (!named) return '';
+    return ({колян: 'claude', claude: 'claude', жека: 'codex', codex: 'codex', гриха: 'grok', grok: 'grok'})[named[1].toLowerCase()] || '';
+  }
+  // Пустой набор и метки с именами — плашки из меток. Обращение по имени плашки не ставит: ответит он один.
+  function adoptMarksIfEmpty() {
+    if (responseOrder.length || draftAddressee()) return;
+    const from = providersFromMarks($('draft').value);
+    if (from.length) responseOrder = from.slice(0, responderCap());
+  }
+  function syncMarksToOrder(kind) {
+    const next = syncPassMarks($('draft').value, responseOrder, kind || 'names');
+    if (next === $('draft').value) return false;
+    suppressMarkSync = true;
+    $('draft').value = next;
+    suppressMarkSync = false;
+    return true;
+  }
+  function passNotes(text, orderNames, where) {
+    const marks = passMarks(text);
+    // Текст без меток Trio не размечает: жёлтая строка только когда метки уже есть.
+    if (!marks.length) return [];
+    const place = where === 'цепочке' ? 'в цепочке' : 'на плашке';
+    const lines = [];
+    const seen = new Set();
+    for (const mark of marks) {
+      if (seen.has(mark.pass)) continue;
+      seen.add(mark.pass);
+      const chip = orderNames[mark.pass - 1];
+      if (!chip) lines.push('Кто будет выполнять проход ' + mark.pass + '? Добавь исполнителя или убери пункт.');
+      else if (chip !== mark.name) lines.push('Проход ' + mark.pass + ' в тексте — ' + mark.name + ', а ' + place + ' — ' + chip + '.');
+    }
+    for (let i = 0; i < orderNames.length; i++) {
+      if (!orderNames[i] || seen.has(i + 1)) continue;
+      lines.push('Для прохода ' + (i + 1) + ' (' + orderNames[i] + ') в тексте нет пункта. Он получит всё сообщение без своего задания.');
+    }
+    return lines;
+  }
+  function addressNote() {
+    if (responseOrder.length) return '';
+    const who = draftAddressee();
+    if (!who) return '';
+    const uniq = [];
+    for (const mark of passMarks($('draft').value)) {
+      if (mark.name === '?' || uniq.includes(mark.name)) continue;
+      uniq.push(mark.name);
+    }
+    if (uniq.length > 1 || (uniq.length === 1 && uniq[0] !== names[who]))
+      return 'Ответит только ' + names[who] + '. В тексте есть проходы других участников, а плашек нет.';
+    return '';
+  }
+  function paintPassHint() {
+    const lines = [];
+    if (droppedNote) lines.push(droppedNote);
+    // Без плашек и с обращением по имени отдельная строка уже говорит, кто ответит.
+    if (responseOrder.length || !draftAddressee())
+      lines.push(...passNotes($('draft').value || '', responseOrder.map(id => names[id]), 'плашке'));
+    const addressed = addressNote();
+    if (addressed) lines.push(addressed);
+    const text = lines.filter(Boolean).join('\n');
+    $('pass-hint').hidden = !text;
+    $('pass-hint').textContent = text;
+  }
+  function chainNames(state, messageId) {
+    const group = state.turns.filter(t => t.messageId === messageId && !t.summary);
+    const withPass = group.filter(t => t.pass);
+    if (!withPass.length) return group.map(t => names[t.recipient] || '?');
+    const slots = [];
+    for (const turn of withPass) {
+      const at = turn.pass - 1;
+      if (at >= 0 && slots[at] === undefined) slots[at] = names[turn.recipient] || '?';
+    }
+    return slots;
   }
   function renderOrder() {
     if (!snapshot) return;
     const enabled = snapshot.state.agents.filter(a => a.enabled);
-    responseOrder = responseOrder.filter(p => enabled.some(a => a.id === p));
+    const enabledIds = new Set(enabled.map(a => a.id));
+    const before = responseOrder.slice(0, responderCap());
+    const kept = [];
+    const dropped = [];
+    before.forEach((p, index) => {
+      if (enabledIds.has(p)) kept.push(p);
+      else dropped.push({provider: p, index});
+    });
+    responseOrder = kept;
+    if (dropped.length) {
+      syncMarksToOrder('drop');
+      droppedNote = droppedSentences(dropped, kept);
+      preserveDraft();
+    }
+    const counts = {};
+    for (const id of responseOrder) counts[id] = (counts[id] || 0) + 1;
     $('response-order').replaceChildren(...enabled.map(a => {
-      const index = responseOrder.indexOf(a.id);
-      const control = button((index < 0 ? '' : (index + 1) + ' ') + names[a.id], () => {
-        responseOrder = index < 0 ? [...responseOrder, a.id] : responseOrder.filter(p => p !== a.id);
+      const count = counts[a.id] || 0;
+      const control = button(names[a.id], () => {
+        if (responseOrder.length >= responderCap()) return;
+        responseOrder = [...responseOrder, a.id];
+        droppedNote = '';
+        syncMarksToOrder('add');
         preserveDraft(); renderOrder();
-      }, sendPending || attaching || resetPending, index < 0 ? '' : 'selected');
-      control.setAttribute('aria-pressed', String(index >= 0));
-      control.title = 'Выбрать порядок ответа. Повторный клик снимает выбор.';
+      }, sendPending || attaching || resetPending, ((count > 0 ? 'selected ' : '') + plateClass(a.id)).trim());
+      control.setAttribute('aria-pressed', String(count > 0));
+      control.title = 'Добавить в цепочку. Повторный клик ставит агента ещё раз. Крестик в строке сверху снимает один шаг.';
       return control;
     }));
-    $('order-hint').textContent = responseOrder.length
-      ? responseOrder.map((p, i) => (i + 1) + ' ' + names[p]).join(' → ') + '. Следующий — после твоего клика.'
-      : 'Выбери отвечающих или обратись по имени.';
-    $('response-order').title = $('order-hint').textContent;
-    const named = ($('draft').value || '').trim().match(/^(?:@)?(колян|claude|жека|codex|гриха|grok)(?=[\s,:.!?]|$)/iu);
-    const pick = responseOrder.length ? responseOrder
-      : named ? [({колян:'claude',claude:'claude',жека:'codex',codex:'codex',гриха:'grok',grok:'grok'})[named[1].toLowerCase()]] : [];
+    const strip = $('order-strip');
+    strip.hidden = !responseOrder.length;
+    const locked = sendPending || attaching || resetPending;
+    const clear = plateFace('Очистить', () => {
+      responseOrder = [];
+      droppedNote = '';
+      syncMarksToOrder('clear');
+      preserveDraft(); renderOrder();
+    }, locked, 'order-step order-clear');
+    clear.title = 'Снять весь набор отвечающих';
+    strip.replaceChildren(...responseOrder.map((p, index) => {
+      const step = element('span', ('order-step ' + plateClass(p)).trim());
+      step.draggable = !locked;
+      step.title = 'Перетащи на другое место, пока сообщение не отправлено. Номер пункта в тексте не меняется.';
+      step.ondragstart = event => {
+        if (locked) {event.preventDefault?.(); return;}
+        orderDrag = index;
+        step.classList.add('dragging');
+        if (event.dataTransfer) {
+          event.dataTransfer.effectAllowed = 'move';
+          event.dataTransfer.setData('text/plain', String(index));
+        }
+      };
+      step.ondragend = () => {orderDrag = -1; step.classList.remove('dragging');};
+      step.ondragover = event => {
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+      };
+      step.ondrop = event => {
+        event.preventDefault();
+        if (event.stopPropagation) event.stopPropagation();
+        const from = orderDrag;
+        orderDrag = -1;
+        if (locked || from < 0 || from === index) return;
+        const next = responseOrder.slice();
+        const [moved] = next.splice(from, 1);
+        next.splice(index, 0, moved);
+        responseOrder = next;
+        droppedNote = '';
+        syncMarksToOrder('names');
+        preserveDraft();
+        renderOrder();
+      };
+      const no = element('span', 'order-step-no', String(index + 1));
+      const main = element('span', 'order-step-main', names[p]);
+      const close = plateFace('×', () => {
+        responseOrder = responseOrder.filter((_, at) => at !== index);
+        droppedNote = '';
+        syncMarksToOrder('drop');
+        preserveDraft(); renderOrder();
+      }, locked, 'order-step-x');
+      close.title = 'Снять этот шаг: ' + names[p];
+      close.setAttribute('aria-label', 'Снять ' + names[p] + ' с места ' + (index + 1));
+      step.append(no, main, close);
+      return step;
+    }), clear);
+    $('order-hint').hidden = responseOrder.length > 0;
+    $('order-hint').textContent = 'Выбери отвечающих или обратись по имени.';
+    $('response-order').title = responseOrder.length
+      ? responseOrder.map(p => names[p]).join(' › ')
+      : $('order-hint').textContent;
+    const addressedId = draftAddressee();
+    const pick = responseOrder.length ? responseOrder : addressedId ? [addressedId] : [];
     const heavy = (snapshot.deltas || []).filter(d => (d.chars >= 20000 || d.kind === 'full') && pick.includes(d.provider));
     $('delta-hint').hidden = !heavy.length;
     $('delta-hint').classList.toggle('warn', heavy.some(d => d.chars >= 20000));
@@ -375,6 +654,8 @@
     $('delta-hint').textContent = parts.join(' · ')
       + '. Это уйдёт в CLI следующим ходом и забьёт окно. Не нужно — не передавай ему слово.';
     $('delta-hint').title = 'Полная лента — нет сессии (первый ход или сброс). «Сжал историю» — движок выбросил свой контекст, курсор дельты стёрт. Дельта — только новое с его последнего ответа.';
+    paintPassHint();
+    fitComposer();
   }
   const askKey = item => item.id || item.prompt;
   const answerLabels = value => Array.isArray(value) ? [...new Set(value)] : value ? [value] : [];
@@ -655,7 +936,7 @@
   function answeringLine(state, active, liveTime) {
     const live = active && state.turns.find(t => t.id === active.turnId);
     const cycle = live?.cycle > 1 ? ' · цикл ' + live.cycle : '';
-    return names[active.provider] + ' отвечает' + (liveTime ? ' · ' + liveTime : '') + cycle;
+    return names[active.provider] + ' отвечает' + (liveTime ? ' · ' + liveTime : '') + cycle + (state.paused ? ' · затем пауза' : '');
   }
   // Keep in sync with questionNumber, replyNumber and messageMark in src/shared/model.ts.
   // One pass per paint. Recounting every card against the whole feed froze typing.
@@ -757,57 +1038,213 @@
     if (folded) folded.open = true;
     row.scrollIntoView({block: 'center'});
   }
-  function questionQueue(state, messageId, busy) {
+  // A plate face is a span. A <button> takes the webview command-button chrome and covers the chip.
+  function plateFace(text, fn, disabled, className) {
+    const node = element('span', className, text);
+    if (!fn) return node;
+    node.setAttribute('role', 'button');
+    node.tabIndex = disabled ? -1 : 0;
+    if (disabled) node.setAttribute('aria-disabled', 'true');
+    node.onclick = () => {if (!disabled) fn();};
+    node.onkeydown = event => {
+      if (disabled || (event.key !== 'Enter' && event.key !== ' ')) return;
+      event.preventDefault();
+      fn();
+    };
+    return node;
+  }
+  // Agent colour for a plate or a chosen «Отвечают» button. «Любой» and «Все» stay neutral.
+  function plateClass(p) {return ['claude', 'codex', 'grok'].includes(p) ? 'plate-' + p : '';}
+  // One plate per step. Clickable only when that step may start now; × drops just this step.
+  function queueStep(label, kind, title, onMain, onRemove, provider) {
+    const step = element('div', ('queue-step ' + kind + ' ' + plateClass(provider)).trim());
+    const main = plateFace(label, onMain, false, 'step-main');
+    main.title = title; step.append(main);
+    if (onRemove) {
+      const x = plateFace('×', onRemove, resetPending, 'step-x');
+      x.title = 'Снять этот шаг: ' + label + ' не будет отвечать на этот вопрос';
+      x.setAttribute('aria-label', 'Снять шаг ' + label);
+      step.append(x);
+    }
+    return step;
+  }
+  // A question nobody has started on yet: only such a card can be edited or dragged.
+  function untouched(state, messageId) {
+    const group = state.turns.filter(t => t.messageId === messageId);
+    return group.some(t => state.queue.includes(t.id)) && !group.some(t => t.executor || t.summary);
+  }
+  function queueCard(state, messageId, view) {
     const source = state.messages.find(m => m.id === messageId);
     const group = state.turns.filter(t => t.messageId === messageId);
     const pending = group.filter(t => state.queue.includes(t.id));
-    const row = element('div', 'queued-question'), title = element('div', 'queue-title'), actions = element('div', 'queue-actions');
-    title.append(button('#' + questionNumber(state, messageId), () => revealQuestion(messageId)),
-      element('span', '', source?.text?.slice(0, 180) || source?.attachments?.map(a => a.label).join(', ') || 'Вопрос'));
+    const summary = group.some(t => t.summary);
+    const movable = untouched(state, messageId);
+    const editing = queueEditing.messageId === messageId;
+    const number = questionNumber(state, messageId);
+    const card = element('div', 'queue-card' + (group.some(t => t.id === view.activeTurnId) ? ' current' : ''));
+    card.dataset.messageId = messageId;
+    const head = element('div', 'queue-head');
+    const jump = button('#' + number, () => revealQuestion(messageId), false, 'queue-no');
+    jump.title = 'Показать вопрос #' + number + ' в ленте';
+    head.append(jump);
     const cycle = group.find(t => t.cycle > 1)?.cycle;
-    if (cycle) title.append(element('span', 'cycle-badge', 'цикл ' + cycle));
-    title.title = source?.text?.slice(0, 1000) || '';
-    group.forEach((turn, index) => {
-      const prefix = group.length > 1 ? (index + 1) + '. ' : '';
-      if (turn.status === 'completed') actions.append(element('span', 'done', prefix + names[turn.executor] + ' ✓'));
-      else if (turn.status === 'running' || turn.status === 'preparing') actions.append(element('span', 'done', prefix + names[turn.executor] + '…'));
-      else if (state.queue.includes(turn.id)) {
-        if (turn.summary) {
-          actions.append(element('span', 'done', 'сводка следом'));
-          actions.append(button('Снять', () => post('discard', {turnId: turn.id}), resetPending, 'cancel'));
-        } else {
-          for (const a of state.agents.filter(a => a.enabled && (turn.recipient === 'all' || a.id === turn.recipient))) {
-            const ready = !busy && pending[0]?.id === turn.id;
-            const going = !!state.autoReply && busy;
-            const control = button(prefix + names[a.id] + '\n' + (going ? 'пойдёт сам' : 'ответить'),
-              () => post('handoff', {provider: a.id, turnId: turn.id}),
-              !ready, ready ? 'next' : '');
-            control.title = going
-              ? names[a.id] + ' пойдёт сам по автоответу'
-              : 'Разрешить один ответ ' + names[a.id] + ' на вопрос #' + questionNumber(state, messageId);
-            actions.append(control);
-          }
-          actions.append(button('Снять' + (group.length > 1 ? ' ' + (index + 1) : ''), () => post('discard', {turnId: turn.id}), resetPending, 'cancel'));
+    if (cycle) head.append(element('span', 'cycle-badge', 'цикл ' + cycle));
+    if (movable && !editing) {
+      const grip = element('span', 'queue-grip', '⋮⋮');
+      grip.title = 'Перетащи карточку мышкой, чтобы поменять место вопроса в очереди. Начатые вопросы стоят сверху.';
+      head.append(element('span', 'spacer'), grip);
+      card.draggable = true;
+      card.title = 'Карточку можно перетащить мышкой на другое место в очереди';
+      card.addEventListener('dragstart', event => {
+        queueDrag = messageId; card.classList.add('dragging');
+        if (event.dataTransfer) {event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', '#' + number);}
+      });
+      card.addEventListener('dragend', () => {queueDrag = ''; card.classList.remove('dragging'); clearDropMarks();});
+    }
+    card.append(head);
+    if (editing) {
+      const box = element('textarea', 'queue-edit');
+      box.value = queueEditing.text; box.rows = 5;
+      box.setAttribute('aria-label', 'Текст вопроса #' + number);
+      box.title = 'Правка текста вопроса. «Применить» сохраняет, Esc отменяет.';
+      box.oninput = () => {queueEditing.text = box.value;};
+      box.addEventListener('keydown', event => {
+        if (event.key === 'Escape') {event.preventDefault(); queueEditing = {messageId: '', text: ''}; queueSignature = ''; render();}
+      });
+      queueEditBox = box;
+      card.append(box);
+    } else {
+      const text = summary ? 'Сводка для нового разговора' : source?.text || '';
+      const body = element('div', 'queue-text', text);
+      body.title = 'Текст вопроса #' + number + (movable ? '. Изменить — «Редактировать».' : '');
+      card.append(body);
+      if (source?.attachments?.length) card.append(element('div', 'queue-files', 'Вложения: ' + source.attachments.map(a => a.label).join(', ')));
+    }
+    const steps = element('div', 'queue-plates');
+    steps.setAttribute('aria-label', 'Порядок ответов на вопрос #' + number);
+    for (const turn of group) {
+      const queued = state.queue.includes(turn.id);
+      if (turn.summary && queued) {
+        steps.append(queueStep('Сводка', 'waiting', names[turn.recipient] + ' подготовит сводку для нового разговора',
+          null, () => post('discard', {turnId: turn.id}), turn.recipient));
+      } else if (turn.status === 'completed') {
+        steps.append(queueStep(names[turn.executor] + ' ✓', 'done', names[turn.executor] + ' ответил', null, null, turn.executor));
+      } else if (turn.status === 'running' || turn.status === 'preparing') {
+        steps.append(queueStep(names[turn.executor] + '…', 'running', names[turn.executor] + ' отвечает сейчас', null, null, turn.executor));
+      } else if (queued) {
+        const who = state.agents.filter(a => a.enabled && (turn.recipient === 'all' || a.id === turn.recipient));
+        for (const a of who.length ? who : [{id: turn.recipient}]) {
+          const name = names[a.id] || 'Любой';
+          const ready = !view.busy && !view.paused && pending[0]?.id === turn.id && who.length > 0;
+          const title = !who.length ? name + ' выключен. Включи его карточку или сними этот шаг.'
+            : view.paused ? 'Очередь на паузе. ' + name + ' начнёт после «Продолжить».'
+            : ready ? 'Разрешить один ответ ' + name + ' на вопрос #' + number
+            : state.autoReply ? name + ' пойдёт сам по автоответу, когда подойдёт очередь'
+            : name + ' ждёт своей очереди. Когда подойдёт, плашка замигает: клик — ответить.';
+          steps.append(queueStep(name, ready ? (turn.id === view.headTurnId ? 'next' : 'ready') : 'waiting', title,
+            ready ? () => post('handoff', {provider: a.id, turnId: turn.id}) : null,
+            () => post('discard', {turnId: turn.id}), a.id));
         }
-      } else actions.append(element('span', 'done', prefix + (names[turn.executor || turn.recipient] || '') + ' · ' + (turn.status === 'failed' ? 'ошибка' : 'снят')));
-    });
-    row.append(title, actions); return row;
+      } else {
+        const name = names[turn.executor || turn.recipient] || 'Все';
+        steps.append(queueStep(name + ' · ' + (turn.status === 'failed' ? 'ошибка' : 'снят'), 'done',
+          name + (turn.status === 'failed' ? ': ход оборвался с ошибкой' : ': шаг снят'), null, null, turn.executor || turn.recipient));
+      }
+    }
+    card.append(steps);
+    if (queuePassNotes[messageId]) card.append(element('p', 'pause-hint queue-pass-hint', queuePassNotes[messageId]));
+    if (pending.length) {
+      const tools = element('div', 'queue-tools');
+      if (movable) {
+        const edit = button(editing ? 'Применить' : 'Редактировать', () => {
+          if (!editing) {queueEditing = {messageId, text: source?.text || ''}; queueSignature = ''; render(); queueEditBox?.focus?.(); return;}
+          const note = passNotes(queueEditing.text, chainNames(state, messageId), 'цепочке').join('\n');
+          if (note) queuePassNotes[messageId] = note;
+          else delete queuePassNotes[messageId];
+          queueSignature = '';
+          post('queue-edit', {messageId, text: queueEditing.text}, error => {
+            if (error) return;
+            queueEditing = {messageId: '', text: ''}; queueSignature = ''; render();
+          });
+          render();
+        }, resetPending, editing ? 'primary' : '');
+        edit.title = editing ? 'Сохранить новый текст вопроса' : 'Править текст прямо здесь. Можно, пока на вопрос никто не начал отвечать.';
+        tools.append(edit);
+      }
+      const remove = button('Удалить', () => {
+        if (editing) queueEditing = {messageId: '', text: ''};
+        post('queue-remove', {messageId});
+      }, resetPending, 'queue-remove');
+      remove.title = movable || summary ? 'Убрать вопрос #' + number + ' из очереди. В ленте он останется зачёркнутым.'
+        : 'Снять оставшиеся шаги вопроса #' + number + '. Уже данные ответы останутся.';
+      tools.append(remove);
+      card.append(tools);
+    }
+    return card;
+  }
+  function clearDropMarks() {
+    for (const card of $('queued').children || []) card.classList.remove('drop-before', 'drop-after');
+  }
+  // Above the middle of a card — before it, below — before the next one, past the last — to the end.
+  function dropSpot(event) {
+    const card = event.target?.closest?.('.queue-card');
+    if (!card) return {card: null, before: undefined, after: false};
+    const rect = card.getBoundingClientRect();
+    if (event.clientY < rect.top + rect.height / 2) return {card, before: card.dataset.messageId, after: false};
+    return {card, before: card.nextElementSibling?.dataset?.messageId, after: true};
   }
   function renderQueue(state, busy) {
+    const active = snapshot.active;
+    const activeTurn = active ? state.turns.find(t => t.id === active.turnId) : undefined;
     const queued = state.queue.map(id => state.turns.find(t => t.id === id)).filter(Boolean);
-    const nextId = queued[0]?.messageId;
-    const rest = [...new Set(queued.filter(t => t.messageId !== nextId).map(t => t.messageId))];
-    const key = JSON.stringify([state.queue, state.turns, busy, state.autoReply, nextId, rest, state.agents]);
+    const ids = [...new Set([...(activeTurn ? [activeTurn.messageId] : []), ...queued.map(t => t.messageId)])];
+    if (queueEditing.messageId && !untouched(state, queueEditing.messageId)) {
+      queueEditing = {messageId: '', text: ''};
+      notice('На вопрос уже начали отвечать или его убрали. Правка не сохранена.', true);
+    }
+    const shown = new Set(ids);
+    const key = JSON.stringify([state.queue, ids.map(id => questionNumber(state, id)),
+      state.turns.filter(t => shown.has(t.messageId)).map(t => [t.id, t.status, t.executor, t.recipient, t.cycle, t.summary]),
+      ids.map(id => {const m = state.messages.find(x => x.id === id); return [m?.text, (m?.attachments || []).map(a => a.label)];}),
+      busy, !!state.paused, !!state.autoReply, activeTurn?.id, state.agents.map(a => [a.id, a.enabled]),
+      queueEditing.messageId, queuePassNotes, resetPending]);
     if (key === queueSignature) return; queueSignature = key;
-    $('queued').hidden = !nextId;
-    $('queue-empty').hidden = !!nextId;
-    $('queued').replaceChildren(...(nextId ? [questionQueue(state, nextId, busy)] : []));
-    $('older-queue').hidden = !rest.length;
-    if (!rest.length) $('older-queue').open = false;
-    $('older-summary').textContent = 'Ещё: ' + rest.length;
-    $('older-summary').title = 'Другие ожидающие вопросы: ' + rest.length;
-    $('older-summary').setAttribute('aria-label', 'Другие ожидающие вопросы: ' + rest.length);
-    $('older-rows').replaceChildren(...rest.map(id => questionQueue(state, id, busy)));
+    const list = $('queue-list'), scroll = list.scrollTop;
+    const old = queueEditBox, typing = !!old && document.activeElement === old;
+    const caret = typing ? [old.selectionStart, old.selectionEnd] : undefined;
+    queueEditBox = undefined;
+    const view = {busy, paused: !!state.paused, activeTurnId: activeTurn?.id, headTurnId: queued.find(t => t.status === 'proposed')?.id};
+    $('queued').hidden = !ids.length;
+    $('queue-empty').hidden = !!ids.length;
+    $('queued').replaceChildren(...ids.map(id => queueCard(state, id, view)));
+    list.scrollTop = scroll;
+    if (typing && queueEditBox) {queueEditBox.focus(); queueEditBox.setSelectionRange?.(caret[0], caret[1]);}
+  }
+  // Пауза → Отменить паузу, пока агент дорабатывает → Продолжить. Продолжить же и для
+  // очереди, вставшей без паузы: после Стоп, обрыва хода или закрытия окна при включённом Авто.
+  function paintPause(state, active, busy) {
+    const head = state.queue.map(id => state.turns.find(t => t.id === id)).find(t => t && t.status === 'proposed');
+    const paused = !!state.paused, number = head ? questionNumber(state, head.messageId) : 0;
+    const stalled = !paused && !busy && !!state.autoReply && !!head && !head.summary;
+    const pause = $('pause');
+    let label = 'Пауза', title = 'Пауза: текущий агент спокойно закончит ход, следующий из очереди не начнёт. '
+      + 'Пауза хранится на диске и переживёт закрытие VS Code. Во время паузы можно отправить вопрос вне очереди. '
+      + 'Учти, что это может сбить с толку заготовленную очередь, которая пойдёт после незапланированного вопроса.';
+    if (paused && active) {
+      label = 'Отменить паузу';
+      title = 'Пауза ждёт, пока ' + names[active.provider] + ' закончит ход. Нажми, чтобы отменить паузу: очередь пойдёт дальше как обычно.';
+    } else if (paused) {
+      label = 'Продолжить';
+      title = head ? 'Очередь на паузе. Нажми, чтобы продолжить с #' + number + '.' : 'Очередь на паузе и пуста. Нажми, чтобы снять паузу.';
+    } else if (stalled) {
+      label = 'Продолжить';
+      title = 'Очередь стоит: был «Стоп», ход оборвался или окно закрывалось. Нажми, чтобы продолжить с #' + number + '.';
+    }
+    pauseWants = !paused && !stalled;
+    pause.textContent = label; pause.title = title;
+    pause.classList.toggle('selected', paused);
+    pause.setAttribute('aria-pressed', String(paused));
+    pause.disabled = resetPending || (pauseWants && !head);
   }
   function summaryHold(state) {
     return (state?.turns || []).some(t => t.summary && (t.status === 'proposed' || t.status === 'preparing' || t.status === 'running'));
@@ -988,13 +1425,16 @@
     } else {
       const live = active && state.turns.find(t => t.id === active.turnId);
       const liveTime = turnElapsed(live, true);
-      $('floor-title').textContent = active ? answeringLine(state, active, liveTime) : 'Готово';
+      const resting = !active && !!state.paused;
+      $('floor-title').textContent = active ? answeringLine(state, active, liveTime) : resting ? 'Пауза' : 'Готово';
       $('floor-dot').classList.toggle('busy', !!active);
-      $('floor-dot').classList.toggle('wait', false);
-      $('floor-detail').textContent = active ? progress || '' : '';
-      $('floor-detail').title = progress || '';
+      $('floor-dot').classList.toggle('wait', resting);
+      const detail = active ? progress || '' : resting ? 'Очередь стоит до «Продолжить».' : '';
+      $('floor-detail').textContent = detail;
+      $('floor-detail').title = detail;
     }
     $('stop-all').disabled = !active && !compacting;
+    paintPause(state, active, busy);
     const autoOn = !!state.autoReply, editsOn = !!state.autoEdits, cmdsOn = !!state.autoCommands;
     $('auto-reply').classList.toggle('selected', autoOn);
     $('auto-reply').setAttribute('aria-pressed', String(autoOn));
@@ -1020,7 +1460,9 @@
       $('fresh-go').disabled = !!compacting || hold || resetPending || !state.agents.some(a => a.enabled && a.id === freshProvider);
     }
     $('draft').disabled = resetPending;
-    $('send').textContent = active ? 'В очередь' : 'Отправить';
+    $('send').textContent = state.paused ? 'Отправить вне очереди' : active ? 'В очередь' : 'Отправить';
+    $('send').title = state.paused ? 'Снимет паузу. Уже начатый вопрос не разрывает: сначала его оставшиеся шаги, потом этот. Ответы на него увидят следующие агенты сценария.' : '';
+    $('pause-hint').hidden = !state.paused;
     $('popout').hidden = !!snapshot.detached;
     $('detached-label').hidden = !snapshot.detached;
     const root = snapshot.root || '';
@@ -1309,12 +1751,21 @@
     }
     $('discuss').classList.toggle('selected', !!flags.discuss);
     $('discuss').setAttribute('aria-pressed', String(!!flags.discuss));
-    responseOrder = Array.isArray(flags.responseOrder) ? flags.responseOrder.filter(p => names[p]) : [];
+    responseOrder = Array.isArray(flags.responseOrder) ? flags.responseOrder.filter(p => names[p]).slice(0, responderCap()) : [];
     renderOrder();
   }
   function applySnippet(snippet) {
+    droppedNote = '';
+    const emptyBefore = responseOrder.length === 0;
     insertDraftText(snippet.text);
     applySnippetFlags(snippet.flags);
+    if (!snippet.flags) {
+      if (emptyBefore) adoptMarksIfEmpty();
+      renderOrder();
+    } else if (!responseOrder.length) {
+      adoptMarksIfEmpty();
+      if (responseOrder.length) renderOrder();
+    }
     preserveDraft();
     closeSnippets();
     $('draft').focus();
@@ -1463,6 +1914,7 @@
     event.preventDefault();
     if (!initialized || sendPending || attaching || resetPending || summaryHold(snapshot?.state) || !$('draft').value.trim() && !attachments.length) return;
     clearTimeout(draftTimer);
+    droppedNote = '';
     const text = $('draft').value, order = [...responseOrder], sentAttachments = [...attachments];
     sendPending = true; render();
     const discuss = /\bselected\b/.test($('discuss').className || '');
@@ -1478,7 +1930,14 @@
       render();
     });
   };
-  $('draft').oninput = () => {rememberDraftCaret(); api.setState(draftValue()); clearTimeout(draftTimer); draftTimer = setTimeout(preserveDraft, 250);};
+  $('draft').oninput = () => {
+    rememberDraftCaret();
+    if (!suppressMarkSync) {droppedNote = ''; adoptMarksIfEmpty();}
+    api.setState(draftValue());
+    clearTimeout(draftTimer);
+    draftTimer = setTimeout(preserveDraft, 250);
+    renderOrder();
+  };
   $('draft').addEventListener('blur', rememberDraftCaret);
   $('draft').addEventListener('select', rememberDraftCaret);
   function addAttachment(attachment) {
@@ -1545,6 +2004,16 @@
     const count = snapshot?.state?.messages?.length || 0;
     $('fresh-count-value').textContent = count.toLocaleString('ru-RU');
     $('fresh-remember').disabled = count < 1;
+    paintFreshQueue();
+  }
+  // The third warning is only for a waiting question. A queued summary is not one.
+  function paintFreshQueue() {
+    const state = snapshot?.state;
+    const waiting = !!state && (state.queue || []).some(id => {
+      const turn = state.turns.find(t => t.id === id);
+      return turn && turn.status === 'proposed' && !turn.summary;
+    });
+    $('fresh-queue').hidden = !waiting;
   }
   function openFresh() {
     if (!initialized || resetPending || sendPending || attaching || snapshot?.compacting || summaryHold(snapshot?.state)) return;
@@ -1599,6 +2068,34 @@
     $('fresh-dialog').close();
   };
   $('stop-all').onclick = () => post('stop');
+  $('pause').onclick = () => post('pause', {on: pauseWants});
+  const toggleAgents = () => {layout.agentsFolded = !layout.agentsFolded; applyLayout(); saveLayout();};
+  $('agents-fold').onclick = toggleAgents;
+  $('queue-fold').onclick = toggleAgents;
+
+  $('queue-list').addEventListener('dragover', event => {
+    if (!queueDrag) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+    // Near an edge the list scrolls by itself, so a card can travel past what is on screen.
+    const list = $('queue-list'), box = list.getBoundingClientRect();
+    if (event.clientY < box.top + 28) list.scrollTop -= 12;
+    else if (event.clientY > box.bottom - 28) list.scrollTop += 12;
+    clearDropMarks();
+    const spot = dropSpot(event);
+    if (spot.card && spot.card.dataset.messageId !== queueDrag) spot.card.classList.add(spot.after ? 'drop-after' : 'drop-before');
+  });
+  $('queue-list').addEventListener('dragleave', event => {
+    if (!event.relatedTarget || !$('queue-list').contains?.(event.relatedTarget)) clearDropMarks();
+  });
+  $('queue-list').addEventListener('drop', event => {
+    if (!queueDrag) return;
+    event.preventDefault();
+    const spot = dropSpot(event), messageId = queueDrag;
+    queueDrag = ''; clearDropMarks();
+    if (spot.before === messageId) return;
+    post('queue-move', {messageId, ...(spot.before ? {before: spot.before} : {})});
+  });
   $('auto-reply').onclick = () => post('flags', {autoReply: !$('auto-reply').classList.contains('selected')});
   $('auto-reply-work').onclick = () => post('flags', {autoReply: !$('auto-reply-work').classList.contains('selected')});
   function warnExecute() {
@@ -1752,11 +2249,11 @@
   }
   function openSearch() {
     $('search-box').hidden = false; $('search-toggle').setAttribute('aria-expanded', 'true');
-    $('search').focus(); $('search').select(); updateSearch(true);
+    $('search').focus(); $('search').select(); updateSearch(true); applyLayout();
   }
   function closeSearch() {
     $('search-box').hidden = true; $('search-toggle').setAttribute('aria-expanded', 'false');
-    updateSearch(false); $('feed').focus();
+    updateSearch(false); $('feed').focus(); applyLayout();
   }
   function moveMatch(direction) {
     updateSearch(false);
@@ -1792,18 +2289,90 @@
     if (!event.target.closest('.more-menu')) {$('more-actions').hidden = true; $('more-toggle').setAttribute('aria-expanded', 'false');}
     if (!event.target.closest('.snippets-wrap') && !event.target.closest('#snippet-dialog')) closeSnippets();
   });
+  const draftMin = 64, draftDefault = 88, draftCeiling = 4000, feedReserve = 72;
+  function takeDraftHeight(source) {
+    const n = source && source.draftHeight;
+    if (typeof n !== 'number' || !Number.isFinite(n)) return;
+    return Math.max(draftMin, Math.min(draftCeiling, Math.round(n)));
+  }
+  function boxHeight(id) {
+    const node = $(id);
+    if (!node || node.hidden) return 0;
+    const box = node.getBoundingClientRect();
+    return box && box.height > 0 ? box.height : 0;
+  }
+  // A pane that has not been measured yet reports height 0. Keep the absolute ceiling so a key still changes the saved height.
+  // scrollHeight is the block's full content, so a max-height clamp does not make the buttons look shorter than they are.
+  function draftSpace() {
+    const pane = boxHeight('chat-pane');
+    if (!pane) return {pane: 0, cap: draftCeiling, room: 0};
+    const field = boxHeight('draft');
+    const content = $('composer').scrollHeight || 0;
+    const chrome = content > field ? content - field : 0;
+    const bar = boxHeight('composer-divider') || 8;
+    const room = Math.max(0, Math.floor(pane - boxHeight('search-box') - bar - feedReserve));
+    return {pane, cap: Math.max(draftMin, room - chrome), room};
+  }
+  function shownDraftHeight() {
+    const saved = layout.draftHeight === undefined ? draftDefault : layout.draftHeight;
+    return Math.max(draftMin, Math.min(draftSpace().cap, saved));
+  }
+  function applyDraftHeight(space) {
+    const box = space || draftSpace();
+    const saved = layout.draftHeight === undefined ? draftDefault : layout.draftHeight;
+    const shown = Math.max(draftMin, Math.min(box.cap, saved));
+    $('draft').style.height = shown + 'px';
+    const grip = $('composer-divider');
+    grip.setAttribute('aria-valuenow', String(shown));
+    grip.setAttribute('aria-valuemin', String(draftMin));
+    grip.setAttribute('aria-valuemax', String(box.cap));
+    if (box.pane) $('chat-pane').style.setProperty('--composer-cap', box.room + 'px');
+  }
+  // Typing calls renderOrder on every letter. Measure only when the block under the field changes height.
+  let composerChrome = '';
+  function composerChromeKey() {
+    const lines = id => {
+      const node = $(id);
+      if (!node || node.hidden) return 0;
+      const text = node.textContent || '';
+      return text ? text.split('\n').length : 1;
+    };
+    const strip = $('order-strip');
+    const files = $('attachments');
+    return [
+      lines('pass-hint'), lines('delta-hint'), lines('pause-hint'),
+      strip && !strip.hidden ? strip.children.length : 0,
+      files ? files.children.length : 0
+    ].join(':');
+  }
+  function fitComposer() {
+    const key = composerChromeKey();
+    if (key === composerChrome) return;
+    composerChrome = key;
+    applyDraftHeight();
+  }
   function applyLayout() {
     layout.width = Math.max(380, Math.min(600, layout.width));
     $('layout').classList.toggle('controls-left', layout.side === 'left');
     $('layout').style.setProperty('--controls-width', layout.width + 'px');
     $('panel-divider').setAttribute('aria-valuenow', String(layout.width));
     $('swap-panels').title = layout.side === 'right' ? 'Управление слева, переписка справа' : 'Переписка слева, управление справа';
+    const agentsOpen = !layout.agentsFolded;
+    $('agents-block').classList.toggle('folded', !agentsOpen);
+    $('agents').hidden = !agentsOpen;
+    $('agents-fold').setAttribute('aria-expanded', String(agentsOpen));
+    $('queue-fold').setAttribute('aria-expanded', String(agentsOpen));
+    $('agents-fold').title = agentsOpen ? 'Свернуть карточки агентов. Очередь займёт освободившуюся высоту.' : 'Развернуть карточки агентов';
+    $('queue-fold').title = agentsOpen
+      ? 'Свернуть агентов. Очередь займёт освободившуюся высоту.'
+      : 'Развернуть агентов. Очередь снова уступит им высоту.';
+    applyDraftHeight();
   }
   function saveLayout() {api.setState(draftValue()); post('layout', layout);}
   $('swap-panels').onclick = () => {layout.side = layout.side === 'left' ? 'right' : 'left'; applyLayout(); saveLayout();};
   const divider = $('panel-divider');
   divider.onpointerdown = event => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || draftDragging) return;
     event.preventDefault(); dragging = true; divider.setPointerCapture(event.pointerId);
     $('layout').classList.add('resizing');
   };
@@ -1821,6 +2390,51 @@
     const delta = (event.key === 'ArrowRight' ? 1 : -1) * (layout.side === 'left' ? 1 : -1) * 20;
     layout.width = Math.max(380, Math.min(600, layout.width + delta)); applyLayout(); saveLayout();
   };
+  const draftGrip = $('composer-divider');
+  let draftStartY = 0, draftStartH = 0;
+  draftGrip.onpointerdown = event => {
+    if (event.button !== 0 || dragging || draftDragging) return;
+    event.preventDefault();
+    draftDragging = true;
+    draftStartY = event.clientY;
+    draftStartH = shownDraftHeight();
+    draftGrip.setPointerCapture(event.pointerId);
+    $('layout').classList.add('composer-resizing');
+  };
+  draftGrip.onpointermove = event => {
+    if (!draftDragging) return;
+    const next = Math.round(draftStartH + (draftStartY - event.clientY));
+    if (!Number.isFinite(next)) return;
+    const space = draftSpace();
+    layout.draftHeight = Math.max(draftMin, Math.min(space.cap, next));
+    applyDraftHeight(space);
+  };
+  function endDraftResize() {
+    if (!draftDragging) return;
+    draftDragging = false;
+    $('layout').classList.remove('composer-resizing');
+    saveLayout();
+  }
+  draftGrip.onpointerup = endDraftResize;
+  draftGrip.onpointercancel = endDraftResize;
+  draftGrip.onlostpointercapture = endDraftResize;
+  draftGrip.ondblclick = () => {
+    layout.draftHeight = draftDefault;
+    applyLayout();
+    saveLayout();
+  };
+  draftGrip.onkeydown = event => {
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+    event.preventDefault();
+    const space = draftSpace();
+    const saved = layout.draftHeight === undefined ? draftDefault : layout.draftHeight;
+    if (event.key === 'ArrowUp') {
+      if (saved >= space.cap) return;
+      layout.draftHeight = Math.min(space.cap, saved + 20);
+    } else layout.draftHeight = Math.max(draftMin, Math.min(saved, space.cap) - 20);
+    applyDraftHeight(space);
+    saveLayout();
+  };
   $('latest').onclick = () => {$('feed').scrollTop = $('feed').scrollHeight;};
   $('feed').onscroll = () => {$('latest').hidden = $('feed').scrollHeight - $('feed').scrollTop - $('feed').clientHeight < 90;};
   window.addEventListener('message', event => {
@@ -1829,7 +2443,12 @@
     if (m.type === 'state') {
       const changed = snapshot && snapshot.state.conversationId !== m.state.conversationId;
       snapshot = m;
-      if (m.layout && !dragging) {layout = {...m.layout}; applyLayout();}
+      if (m.layout && !dragging && !draftDragging) {
+        layout = {...m.layout};
+        const height = takeDraftHeight(layout);
+        if (height === undefined) delete layout.draftHeight; else layout.draftHeight = height;
+        applyLayout();
+      }
       if (Object.prototype.hasOwnProperty.call(m, 'snippets')) {
         snippets = TrioComposer.normalizeSnippets(m.snippets);
         if (!$('snippets-panel').hidden) renderSnippetsList();
@@ -1842,6 +2461,8 @@
         $('draft').value = draft?.text ?? m.state.draft;
         responseOrder = draft?.responseOrder || m.state.responseOrder || [];
         if (!responseOrder.length) {const recipient = draft?.recipient || m.state.recipient; if (recipient && recipient !== 'all') responseOrder = [recipient];}
+        if (!responseOrder.length) adoptMarksIfEmpty();
+        if (changed) {droppedNote = ''; queuePassNotes = {};}
         attachments = draft?.attachments || m.state.draftAttachments || [];
         agentSignature = ''; queueSignature = '';
         render();
@@ -1865,9 +2486,14 @@
     $('connection').textContent = 'Ошибка интерфейса: ' + event.message + '. Нажми ↻ для восстановления.';
   });
   const cachedLayout = api.getState()?.layout;
-  if (cachedLayout && ['left', 'right'].includes(cachedLayout.side) && Number.isFinite(cachedLayout.width)) layout = {side: cachedLayout.side, width: Math.max(260, Math.min(600, cachedLayout.width))};
+  if (cachedLayout && ['left', 'right'].includes(cachedLayout.side) && Number.isFinite(cachedLayout.width)) {
+    layout = {side: cachedLayout.side, width: Math.max(260, Math.min(600, cachedLayout.width)),
+      agentsFolded: cachedLayout.agentsFolded === true};
+    const cachedHeight = takeDraftHeight(cachedLayout);
+    if (cachedHeight !== undefined) layout.draftHeight = cachedHeight;
+  }
   applyLayout();
-  window.addEventListener('resize', () => {if (!$('snippets-panel').hidden) placeSnippetsPanel();});
+  window.addEventListener('resize', () => {if (!$('snippets-panel').hidden) placeSnippetsPanel(); applyLayout();});
   api.setState(api.getState() || {});
   post('ready');
 })();

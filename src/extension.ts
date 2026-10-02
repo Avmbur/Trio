@@ -24,7 +24,7 @@ export async function activate(ctx: vscode.ExtensionContext) {
   let panel: vscode.WebviewPanel | undefined, initializing: Promise<void> | undefined;
   let shuttingDown = false;
   let detached = ctx.workspaceState.get<boolean>('trio.detached', false);
-  let layout = ctx.workspaceState.get<{side: 'left' | 'right'; width: number}>('trio.layout', {side: 'right', width: 400});
+  let layout = ctx.workspaceState.get<{side: 'left' | 'right'; width: number; agentsFolded?: boolean; queueFolded?: boolean; draftHeight?: number}>('trio.layout', {side: 'right', width: 400});
   let snippets: Snippet[] = parseSnippets(ctx.globalState.get('trio.snippets'));
   let refreshPanel: (() => void) | undefined;
   let contextEditor = vscode.window.activeTextEditor;
@@ -36,6 +36,11 @@ export async function activate(ctx: vscode.ExtensionContext) {
   const feedMax = () => {
     const n = config().get<number>('feedMaxMessages', 1000);
     return Number.isInteger(n) && n >= 1 ? Math.min(1000000, n) : 1000;
+  };
+  const maxResponders = () => {
+    const n = config().get<number>('maxResponders', 3);
+    if (!Number.isInteger(n) || n < 1) return 3;
+    return Math.min(n, 10);
   };
   const snapshots = new SnapshotStorage(ctx.globalStorageUri.fsPath, () => config().get<number>('snapshotStorageMiB', 1024) * 1048576);
   const cleanSnapshots = () => snapshots.prune().catch(e => output.appendLine('Snapshots: ' + String(e)));
@@ -82,7 +87,8 @@ export async function activate(ctx: vscode.ExtensionContext) {
       deltas: controller.deltaHints(), snippets,
       // The feed folds long messages; the threshold lives in settings, so it rides along with the state.
       collapseLines: config().get<number>('collapseMessageLines', 100),
-      feedMax: feedMax()});
+      feedMax: feedMax(),
+      maxResponders: maxResponders()});
   };
   const publish = () => {
     if (!publishTimer) publishTimer = setTimeout(() => {publishTimer = undefined; publishNow();}, 40);
@@ -119,6 +125,7 @@ export async function activate(ctx: vscode.ExtensionContext) {
         cli, limit: () => config().get<number>('contextChars', 64000),
         timeout: execute => 1000 * config().get<number>(execute ? 'executionTimeoutSeconds' : 'discussionTimeoutSeconds', execute ? 1800 : 600),
         ceiling: () => 1000 * 60 * config().get<number>('turnCeilingMinutes', 60),
+        maxResponders,
         sessionIdle: () => 1000 * 60 * config().get<number>('sessionIdleMinutes', 55),
         sessionMaxTokens: (provider) => config().get<number>(provider + 'SessionMaxTokens', provider === 'grok' ? 0 : 150000),
         notify: (kind, text) => {
@@ -228,7 +235,15 @@ export async function activate(ctx: vscode.ExtensionContext) {
   async function handle(raw: unknown) {
     const m = input(raw); if (!m) throw new Error('Недопустимое сообщение интерфейса.');
     if (m.type === 'pong') return;
-    if (m.type === 'layout') {layout = {side: m.side, width: m.width}; await ctx.workspaceState.update('trio.layout', layout); publishNow(); return;}
+    if (m.type === 'layout') {
+      const next: {side: 'left' | 'right'; width: number; agentsFolded: boolean; queueFolded: boolean; draftHeight?: number} = {
+        side: m.side, width: m.width, agentsFolded: !!m.agentsFolded, queueFolded: !!m.queueFolded
+      };
+      const height = typeof m.draftHeight === 'number' ? m.draftHeight : layout.draftHeight;
+      if (typeof height === 'number') next.draftHeight = height;
+      layout = next;
+      await ctx.workspaceState.update('trio.layout', layout); publishNow(); return;
+    }
     if (m.type === 'snippets') {snippets = m.items; await ctx.globalState.update('trio.snippets', snippets); publishNow(); return;}
     if (m.type === 'reconnect') {refreshPanel?.(); return;}
     if (m.type === 'copy') {await vscode.env.clipboard.writeText(m.text); return;}
@@ -330,6 +345,10 @@ export async function activate(ctx: vscode.ExtensionContext) {
       }
       case 'agent': await c.configure(m.agent); break;
       case 'discard': await c.discard(m.turnId); break;
+      case 'pause': await c.pause(m.on); break;
+      case 'queue-edit': await c.editQueued(m.messageId, m.text); break;
+      case 'queue-move': await c.moveQueued(m.messageId, m.before); break;
+      case 'queue-remove': await c.removeQueued(m.messageId); break;
       case 'permission': c.permission(m.requestId, m.allow, m.whole, m.standing); break;
       case 'changes': await changes(m.taskId); break;
       case 'plugin-settings': await vscode.commands.executeCommand('workbench.action.openSettings', '@ext:trio-local.trio-chat'); break;
@@ -494,7 +513,7 @@ export async function activate(ctx: vscode.ExtensionContext) {
   ctx.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
     if (e.affectsConfiguration('trio.snapshotStorageMiB')) void cleanSnapshots();
     // A new folding threshold has to reach the open panel without a reload.
-    if (e.affectsConfiguration('trio.collapseMessageLines') || e.affectsConfiguration('trio.feedMaxMessages')) publish();
+    if (e.affectsConfiguration('trio.collapseMessageLines') || e.affectsConfiguration('trio.feedMaxMessages') || e.affectsConfiguration('trio.maxResponders')) publish();
   }));
   ctx.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
     shuttingDown = true; void controller?.stop().catch(fail);

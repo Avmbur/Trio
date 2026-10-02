@@ -5,7 +5,7 @@ const path = require('node:path');
 const os = require('node:os');
 const {Controller} = require('../dist/orchestrator/controller');
 const {Store} = require('../dist/storage/store');
-const {fresh, addressed, assignedMode, input, riskyPermission, permissionClass, permissionSignature, permissionCaption, diskImagePath, plainAttachment, context, contextFit, questionNumber, messageText, agentPromptPrefix, instructionLimit, normalizeInstruction, summaryPrompt, summaryComfort, dangerCover, privilegeIds} = require('../dist/shared/model');
+const {fresh, addressed, assignedMode, input, riskyPermission, permissionClass, permissionSignature, permissionCaption, diskImagePath, plainAttachment, context, contextFit, questionNumber, messageText, agentPromptPrefix, passLine, passMarks, providersFromMarks, rewritePassNames, syncPassMarks, placeDiscussLine, instructionLimit, normalizeInstruction, summaryPrompt, summaryComfort, dangerCover, privilegeIds, privilegeJournalHit, privilegeJournalFile} = require('../dist/shared/model');
 const {brief} = require('../dist/orchestrator/controller');
 test('a tool title never reaches the feed as a wall of script',()=>{
   const script='node -e "'+'const x=1; '.repeat(200)+'"';
@@ -113,12 +113,15 @@ test('one participant runs addressed-all directly; three are representable',asyn
 test('executor assigned in chat; explicit action snapshots once before invoking',async t=>{
   const {c,runs,host,state}=await fixture(t);let snapshots=0;
   host.prepare=async()=>{snapshots++;return 'snapshot';};
+  state.agents.find(a=>a.id==='claude').mode='execute';
   await c.send('Колян, исправь README','all');await c.idle();
   assert.equal(runs[0].provider,'claude');assert.equal(runs[0].execute,true);assert.equal(snapshots,1);
   assert.equal(state.turns[0].snapshot,'snapshot');
   assert.equal(addressed('Пример: «Колян, делай»'),undefined);
   assert.equal(assignedMode('Что значит «делай»?', 'discuss'),'discuss');
-  assert.equal(assignedMode('Колян, исправь файл. обсуждаем, код не трогать','execute'),'discuss');
+  assert.equal(assignedMode('Колян, делай файл','discuss'),'discuss');
+  assert.equal(assignedMode('проверь проект','execute'),'execute');
+  assert.equal(assignedMode('Колян, исправь файл. обсуждаем, код не трогать','execute'),'execute');
   assert.equal(riskyPermission('Read spec.md'),false);
   assert.equal(riskyPermission('Grep','{"pattern":"foo"}'),false);
   assert.equal(riskyPermission('Bash','{"command":"rm -rf"}'),true);
@@ -362,6 +365,7 @@ test('stop while preparing does not wait for a save dialog or start a CLI',async
  const {c,host,runs,state}=await fixture(t);
  let prepared;const ready=new Promise(r=>prepared=r);
  let release;host.prepare=async()=>{prepared();return new Promise(r=>release=r);};
+ state.agents.find(a=>a.id==='claude').mode='execute';
  await c.send('Колян, исправь файл','all');await ready;
  await c.stop();assert.equal(c.busy,false);assert.equal(runs.length,0);
  assert.equal(state.turns[0].status,'interrupted');release('late-snapshot');
@@ -383,6 +387,7 @@ test('retry repeats a failed execute turn without forcing discuss',async t=>{
   if(runs.length===1)return {text:'',interrupted:false,error:'Нет ответа 1 с'};
   return {text:'ok',interrupted:false};
  });
+ state.agents.find(a=>a.id==='claude').mode='execute';
  await c.send('Колян, делай файл','claude');await c.idle();
  assert.equal(state.turns[0].status,'failed');
  assert.equal(state.turns[0].mode,'execute');
@@ -446,7 +451,7 @@ test('numbered order cannot be bypassed, including while queued behind another q
  await c.handoff('claude',pending);await c.idle();
  assert.equal(runs.length,2);
  const before=state.messages.length;
- await assert.rejects(c.send('invalid','all',['codex','codex']),/без повторов/);
+ await assert.rejects(c.send('invalid','all',['codex','codex','codex','codex']),/Не больше 3/);
  assert.equal(state.messages.length,before);
 });
 
@@ -455,6 +460,7 @@ test('second numbered answer cannot start first when the whole group is waiting'
  // Hold an unrelated run in preparation while the group is queued.
  let release,ready; const preparing=new Promise(r=>ready=r);
  c.host.prepare=async()=>{ready();return new Promise(r=>release=r);};
+ state.agents.find(a=>a.id==='claude').mode='execute';
  await c.send('Колян, исправь файл','all');await preparing;
  await c.send('Два мнения','all',['claude','codex']);
  await c.stop();release('unused');
@@ -751,7 +757,9 @@ test('reset requires active work to finish or stop, without dropping any partial
 });
 
 test('UI order and reset input validates providers, duplicates, epoch and action',()=>{
- assert.equal(input({type:'send',text:'x',recipient:'all',responseOrder:['codex','codex']}),undefined);
+ assert.ok(input({type:'send',text:'x',recipient:'all',responseOrder:['codex','codex']}));
+ assert.ok(input({type:'send',text:'x',recipient:'all',responseOrder:Array(10).fill('codex')}));
+ assert.equal(input({type:'send',text:'x',recipient:'all',responseOrder:Array(11).fill('codex')}),undefined);
  assert.equal(input({type:'send',text:'x',recipient:'all',responseOrder:['other']}),undefined);
  assert.equal(input({type:'send',text:'x',recipient:'all',conversationId:4}),undefined);
  assert.equal(input({type:'reset',mode:'delete-files'}),undefined);
@@ -883,6 +891,234 @@ test('stop one person during auto-reply leaves the rest queued',async t=>{
  assert.equal(state.queue.length,1);
  assert.equal(state.turns.find(t=>t.recipient==='codex').status,'proposed');
 });
+test('pause lets the running agent finish, keeps the queue on disk, and Продолжить starts the next',async t=>{
+ let release;const hold=new Promise(r=>release=r);let first=true;
+ const {c,state,runs,store}=await fixture(t,async o=>{
+  if(first){first=false;await hold;}
+  return {text:'ok '+o.provider,interrupted:false};
+ });
+ await c.setFlags({autoReply:true});
+ await c.send('первый','claude');
+ await c.send('второй','codex');
+ await c.pause(true);
+ release();await c.idle();
+ assert.equal(runs.length,1,'the next one does not start during a pause');
+ assert.equal(state.turns[0].status,'completed','the running agent finished normally');
+ assert.equal((await store.load()).paused,true,'pause survives a reload');
+ await assert.rejects(c.handoff('codex',state.queue[0]),/паузе/);
+ await c.pause(false);await c.idle();
+ assert.deepEqual(runs.map(r=>r.provider),['claude','codex']);
+ assert.equal(state.paused,false);
+});
+test('cancelling a pause before the turn ends lets auto-reply carry on',async t=>{
+ let release;const hold=new Promise(r=>release=r);let first=true;
+ const {c,runs}=await fixture(t,async o=>{
+  if(first){first=false;await hold;}
+  return {text:'ok',interrupted:false};
+ });
+ await c.setFlags({autoReply:true});
+ await c.send('первый','claude');await c.send('второй','codex');
+ await c.pause(true);await c.pause(false);
+ assert.equal(runs.length,1,'Отменить паузу does not start anyone while a turn runs');
+ release();await c.idle();
+ assert.deepEqual(runs.map(r=>r.provider),['claude','codex']);
+});
+test('Продолжить without a pause restarts a queue stopped by Стоп одному',async t=>{
+ let started;const ready=new Promise(r=>started=r);let first=true;
+ const {c,runs}=await fixture(t,async o=>{
+  if(first){first=false;started();await new Promise(r=>o.signal.addEventListener('abort',r,{once:true}));return {text:'x',interrupted:true};}
+  return {text:'ok',interrupted:false};
+ });
+ await c.setFlags({autoReply:true});
+ await c.send('всем','all',['claude','codex']);await ready;
+ await c.stop('claude');await c.idle();
+ assert.equal(runs.length,1);
+ await c.pause(false);await c.idle();
+ assert.deepEqual(runs.map(r=>r.provider),['claude','codex']);
+});
+test('a question sent during a pause goes first as a whole cycle and ends the pause',async t=>{
+ let release;const hold=new Promise(r=>release=r);let first=true;
+ const {c,state,runs}=await fixture(t,async o=>{
+  if(first){first=false;await hold;}
+  return {text:'ok '+o.provider,interrupted:false};
+ });
+ await c.setFlags({autoReply:true});
+ await c.send('сценарий','claude');
+ await c.send('дальше по сценарию','codex');
+ await c.pause(true);
+ await c.send('поправка','all',['codex','claude']);
+ assert.equal(state.paused,false);
+ const order=state.queue.map(id=>state.turns.find(t=>t.id===id));
+ assert.deepEqual(order.map(t=>t.recipient),['codex','claude','codex']);
+ assert.deepEqual(order.map(t=>t.cycle),[2,2,3],'cycles follow the new order');
+ release();await c.idle();
+ assert.deepEqual(runs.map(r=>r.provider),['claude','codex','claude','codex']);
+ assert.match(runs[1].prompt,/поправка$/);
+});
+test('a question sent during a pause waits for the rest of the started one and goes before the untouched',async t=>{
+ let release;const hold=new Promise(r=>release=r);let first=true;
+ const {c,state,runs}=await fixture(t,async o=>{
+  if(first){first=false;await hold;}
+  return {text:'ok '+o.provider,interrupted:false};
+ });
+ await c.setFlags({autoReply:true});
+ await c.send('сценарий','all',['codex','claude','codex']);
+ await c.send('дальше','codex');
+ await c.pause(true);
+ await c.send('поправка','claude');
+ const order=state.queue.map(id=>state.turns.find(t=>t.id===id));
+ const text=t=>state.messages.find(m=>m.id===t.messageId).text;
+ assert.deepEqual(order.map(text),['сценарий','сценарий','поправка','дальше']);
+ assert.deepEqual(order.map(t=>t.cycle),[1,1,2,3],'cycles follow the launch order');
+ release();await c.idle();
+ assert.deepEqual(runs.map(r=>r.provider),['codex','claude','codex','claude','codex']);
+});
+test('each step of a chain is told its pass, a repeat keeps its own place, a single answer is not',async t=>{
+ const {c,state,runs}=await fixture(t,async o=>({text:'ok '+o.provider,interrupted:false}));
+ await c.setFlags({autoReply:true});
+ await c.send('по проходам','all',['codex','claude','codex']);await c.idle();
+ assert.deepEqual(runs.map(r=>r.provider),['codex','claude','codex']);
+ const own = n => 'Твой проход — ' + n + ' из 3. Выполни задание этого прохода, учитывая общие указания сообщения.';
+ assert.match(runs[0].prompt, new RegExp('^' + own(1).replace(/[.]/g, '\\.') + '$', 'm'));
+ assert.match(runs[1].prompt, new RegExp('^' + own(2).replace(/[.]/g, '\\.') + '$', 'm'));
+ assert.match(runs[2].prompt, new RegExp('^' + own(3).replace(/[.]/g, '\\.') + '$', 'm'));
+ assert.equal(own(2).includes('['), false);
+ assert.deepEqual(state.turns.map(t=>t.pass),[1,2,3]);
+ await c.send('один','claude');await c.idle();
+ assert.doesNotMatch(runs[3].prompt,/Проход/);
+ assert.doesNotMatch(runs[3].prompt,/Твой проход/);
+});
+test('one recipient with three marks is told pass 1 of 3',async t=>{
+ const {c,state,runs}=await fixture(t,async()=>({text:'ok',interrupted:false}));
+ await c.setFlags({autoReply:true});
+ const text='[Проход 1 из 3: Колян]\nа\n[Проход 2 из 3: Жека]\nб\n[Проход 3 из 3: Гриха]\nв';
+ await c.send(text,'claude');await c.idle();
+ assert.equal(state.turns.length,1);
+ assert.equal(state.turns[0].pass,1);
+ assert.match(runs[0].prompt,/^Твой проход — 1 из 3\. Выполни задание этого прохода, учитывая общие указания сообщения\.$/m);
+});
+test('a step removed after send keeps the pass number; the line is not renumbered',()=>{
+ const chain=[
+  {id:'a',messageId:'m',recipient:'grok',status:'completed',executor:'grok',pass:1},
+  {id:'b',messageId:'m',recipient:'claude',status:'interrupted',pass:2},
+  {id:'c',messageId:'m',recipient:'grok',status:'proposed',pass:3},
+ ];
+ const line = n => 'Твой проход — ' + n + ' из 3. Выполни задание этого прохода, учитывая общие указания сообщения.';
+ assert.equal(passLine(chain[2],chain),line(3));
+ assert.equal(passLine(chain[0],chain),line(1));
+ chain[1].executor='claude';
+ assert.equal(passLine(chain[2],chain),line(3));
+ assert.equal(passLine(chain[1],chain),line(2));
+ assert.equal(passLine({id:'only',messageId:'m',recipient:'grok',pass:1},[{id:'only',messageId:'m',recipient:'grok',pass:1}]),'');
+ const marked='[Проход 1 из 3: Колян]\nа\n[Проход 2 из 3: Жека]\nб\n[Проход 3 из 3: ?]\nв';
+ const two=[
+  {id:'a',messageId:'m',recipient:'claude',pass:1},
+  {id:'b',messageId:'m',recipient:'codex',pass:2},
+ ];
+ assert.equal(passLine(two[0],two,marked),'Твой проход — 1 из 3. Выполни задание этого прохода, учитывая общие указания сообщения.');
+});
+test('pass marks are whole lines only, and chip order rewrites names without touching numbers',()=>{
+ const text = 'смотри [Проход 1 из 2: Колян]\n[Проход 1 из 2: Колян]\nсделай\n[Проход 2 из 2: Жека]\n[Проход 11 из 2: Гриха]\n[Проход 10 из 10: Гриха]\n  [Проход 3 из 2: Колян]\n[Проход 3 из 3: ?]';
+ assert.equal(passMarks('[Проход 1: Колян]').length,0);
+ assert.deepEqual(passMarks(text).map(m=>[m.pass,m.name,m.line]),[[1,'Колян',1],[2,'Жека',3],[10,'Гриха',5],[3,'?',7]]);
+ assert.deepEqual(providersFromMarks('[Проход 1 из 2: ?]\r\n[Проход 2 из 2: Гриха]'),[]);
+ assert.deepEqual(providersFromMarks('[Проход 2 из 2: Жека]\n[Проход 1 из 2: Колян]'),['claude','codex']);
+ assert.deepEqual(providersFromMarks('[Проход 1 из 3: Колян]\n[Проход 3 из 3: Гриха]'),['claude']);
+ assert.deepEqual(passMarks('[Проход 1 из 1: ?]\r\nдальше').map(m=>m.pass),[1]);
+ const body = '[Проход 1 из 2: Колян]\nсделай\n[Проход 2 из 2: Жека]\nпроверь\n[Проход 4 из 4: Гриха]\nещё';
+ assert.equal(rewritePassNames(body,['grok','claude']),
+  '[Проход 1 из 4: Гриха]\nсделай\n[Проход 2 из 4: Колян]\nпроверь\n[Проход 4 из 4: ?]\nещё');
+ assert.equal(rewritePassNames('без меток',['claude']),'без меток');
+ assert.equal(rewritePassNames(body,['claude','codex','grok']),
+  '[Проход 1 из 4: Колян]\nсделай\n[Проход 2 из 4: Жека]\nпроверь\n[Проход 4 из 4: ?]\nещё');
+ const gapped = '[Проход 1 из 3: Колян]\nдело\n[Проход 3 из 3: Гриха]\nещё';
+ assert.equal(rewritePassNames(gapped,['claude','codex','grok']),gapped);
+ assert.equal(rewritePassNames(gapped,['codex','claude','grok']),
+  '[Проход 1 из 3: Жека]\nдело\n[Проход 3 из 3: Гриха]\nещё');
+ assert.equal(rewritePassNames(gapped,['claude','grok','codex']),
+  '[Проход 1 из 3: Колян]\nдело\n[Проход 3 из 3: Жека]\nещё');
+ const intro='общие указания';
+ const added=syncPassMarks(intro,['claude','grok'],'add');
+ assert.equal(added,'общие указания\n\n[Проход 1 из 2: Колян]\n\n[Проход 2 из 2: Гриха]\n');
+ const third=syncPassMarks(added,['claude','grok','codex'],'add');
+ assert.equal(third,'общие указания\n\n[Проход 1 из 3: Колян]\n\n[Проход 2 из 3: Гриха]\n\n[Проход 3 из 3: Жека]\n');
+ assert.equal(syncPassMarks(third,['claude','grok'],'drop'),
+  'общие указания\n\n[Проход 1 из 2: Колян]\n\n[Проход 2 из 2: Гриха]\n');
+ assert.equal(syncPassMarks(third.replace('\n[Проход 3 из 3: Жека]\n','\n[Проход 3 из 3: Жека]\nещё'),['claude','grok'],'drop'),
+  'общие указания\n\n[Проход 1 из 3: Колян]\n\n[Проход 2 из 3: Гриха]\n\n[Проход 3 из 3: ?]\nещё');
+ assert.equal(syncPassMarks(added,[], 'clear'),
+  'общие указания\n\n[Проход 1 из 2: ?]\n\n[Проход 2 из 2: ?]\n');
+ assert.equal(syncPassMarks('обычное',['claude'],'add'),'обычное');
+ assert.equal(syncPassMarks('[Проход 1 из 2: Колян]\n\n[Проход 2 из 2: Жека]\n',['claude'],'drop'),'');
+ const hole='[Проход 1 из 2: Колян]\nа\n[Проход 3 из 3: Гриха]\nб';
+ assert.equal(syncPassMarks(hole,['claude','codex','grok'],'names'),
+  '[Проход 1 из 3: Колян]\nа\n[Проход 3 из 3: Гриха]\nб');
+ assert.equal(syncPassMarks(hole,['claude','codex','grok'],'add'),
+  '[Проход 1 из 3: Колян]\nа\n[Проход 3 из 3: Гриха]\nб');
+ assert.equal(syncPassMarks(hole,['claude','codex','grok','claude'],'add'),
+  '[Проход 1 из 4: Колян]\nа\n[Проход 3 из 4: Гриха]\nб\n\n[Проход 4 из 4: Колян]\n');
+ assert.equal(placeDiscussLine('исправь файл'),'исправь файл\n\nобсуждаем, код не трогать');
+ assert.equal(placeDiscussLine('уже обсуждаем'),'уже обсуждаем');
+ assert.equal(placeDiscussLine('общие указания\n\n[Проход 1 из 2: Колян]\nсделай\n\n[Проход 2 из 2: Жека]\nпроверь'),
+  'общие указания\n\nобсуждаем, код не трогать\n\n[Проход 1 из 2: Колян]\nсделай\n\n[Проход 2 из 2: Жека]\nпроверь');
+ assert.equal(placeDiscussLine('[Проход 1 из 2: Колян]\nа\n\n[Проход 2 из 2: Жека]\nб'),
+  'обсуждаем, код не трогать\n\n[Проход 1 из 2: Колян]\nа\n\n[Проход 2 из 2: Жека]\nб');
+ assert.equal(placeDiscussLine('общие\n\n[Проход 1 из 2: Колян]\nсделай\n\n[Проход 2 из 2: Жека]\nкод не трогать'),
+  'общие\n\nобсуждаем, код не трогать\n\n[Проход 1 из 2: Колян]\nсделай\n\n[Проход 2 из 2: Жека]\nкод не трогать');
+ assert.equal(placeDiscussLine('[Проход 1 из 2: Колян]\nа\n\n[Проход 2 из 2: Жека]\nтут обсуждаем детали'),
+  'обсуждаем, код не трогать\n\n[Проход 1 из 2: Колян]\nа\n\n[Проход 2 из 2: Жека]\nтут обсуждаем детали');
+ assert.equal(placeDiscussLine('обсуждаем\n\n[Проход 1 из 2: Колян]\nа\n\n[Проход 2 из 2: Жека]\nб'),
+  'обсуждаем\n\n[Проход 1 из 2: Колян]\nа\n\n[Проход 2 из 2: Жека]\nб');
+});
+test('a waiting question is edited, moved and removed; a started one is not',async t=>{
+ let release;const hold=new Promise(r=>release=r);let first=true;
+ const {c,state}=await fixture(t,async o=>{
+  if(first){first=false;await hold;}
+  return {text:'ok',interrupted:false};
+ });
+ await c.send('A','all',['claude','codex']);
+ await c.send('B','codex');
+ await c.send('C','claude');
+ const id=text=>state.messages.find(m=>m.text===text).id;
+ const order=()=>[...new Set(state.queue.map(q=>state.turns.find(t=>t.id===q).messageId))].map(m=>state.messages.find(x=>x.id===m).text);
+ await assert.rejects(c.editQueued(id('A'),'A2'),/не начали отвечать/);
+ await c.editQueued(id('B'),'B2');
+ assert.equal(state.messages.find(m=>m.id===id('B2')).text,'B2');
+ await assert.rejects(c.editQueued(id('C'),'   '),/Пустой вопрос/);
+ await assert.rejects(c.moveQueued(id('A')),/не начали отвечать/);
+ await c.moveQueued(id('C'),id('A'));
+ assert.deepEqual(order(),['A','C','B2'],'the started question stays on top');
+ assert.deepEqual(state.queue.map(q=>state.turns.find(t=>t.id===q).cycle),[1,2,3]);
+ await c.moveQueued(id('C'));
+ assert.deepEqual(order(),['A','B2','C']);
+ await c.removeQueued(id('B2'));
+ assert.deepEqual(order(),['A','C']);
+ assert.equal(state.messages.find(m=>m.text==='B2').cancelled,true);
+ assert.deepEqual(state.queue.map(q=>state.turns.find(t=>t.id===q).cycle),[1,2]);
+ await c.removeQueued(id('A'));
+ assert.deepEqual(order(),['C'],'remaining steps of a started question are dropped');
+ assert.notEqual(state.messages.find(m=>m.text==='A').cancelled,true,'it was answered, so it is not struck out');
+ release();await c.idle();
+});
+test('queue and pause messages from the panel are validated',()=>{
+ assert.ok(input({type:'pause',on:true}));
+ assert.equal(input({type:'pause',on:'yes'}),undefined);
+ assert.ok(input({type:'queue-edit',messageId:'m',text:'x'}));
+ assert.equal(input({type:'queue-edit',messageId:'m'}),undefined);
+ assert.ok(input({type:'queue-move',messageId:'m'}));
+ assert.ok(input({type:'queue-move',messageId:'m',before:'n'}));
+ assert.equal(input({type:'queue-move',messageId:'m',before:3}),undefined);
+ assert.ok(input({type:'queue-remove',messageId:'m'}));
+ assert.ok(input({type:'layout',side:'right',width:400,agentsFolded:true,queueFolded:false}));
+ assert.equal(input({type:'layout',side:'right',width:400,agentsFolded:'да'}),undefined);
+ assert.equal(input({type:'layout',side:'right',width:400,draftHeight:64}).draftHeight,64);
+ assert.equal(input({type:'layout',side:'right',width:400,draftHeight:4000}).draftHeight,4000);
+ assert.equal(input({type:'layout',side:'right',width:400,draftHeight:63.9}),undefined);
+ assert.equal(input({type:'layout',side:'right',width:400,draftHeight:4000.1}),undefined);
+ assert.equal(input({type:'layout',side:'right',width:400,draftHeight:10}),undefined);
+ assert.equal(input({type:'layout',side:'right',width:400,draftHeight:'120'}),undefined);
+ assert.ok(input({type:'layout',side:'right',width:400}));
+});
 test('with auto-reply off a second question still waits for a click',async t=>{
  let release;const hold=new Promise(r=>release=r);let first=true;
  const {c,state,runs}=await fixture(t,async o=>{
@@ -895,11 +1131,72 @@ test('with auto-reply off a second question still waits for a click',async t=>{
  assert.equal(runs.length,1);
  assert.ok(state.queue.includes(state.turns.find(t=>t.recipient==='codex').id));
 });
-test('a failed auto-reply turn does not start the next agent',async t=>{
- const {c,runs}=await fixture(t,async()=>({text:'',error:'лимит',interrupted:false}));
+test('a failed turn inside a chain starts the next agent with the Trio reason',async t=>{
+ let n=0;
+ const {c,state,runs}=await fixture(t,async()=>{
+  n++;
+  if(n===1)return {text:'',error:'лимит окна',interrupted:false};
+  return {text:'дальше',interrupted:false};
+ });
  await c.setFlags({autoReply:true});
  await c.send('всем','all',['claude','codex']);await c.idle();
+ assert.equal(runs.length,2);
+ assert.match(runs[1].prompt,/лимит окна/);
+ assert.equal(state.turns[0].status,'failed');
+ assert.equal(state.turns[1].status,'completed');
+});
+test('a denied permission inside a chain starts the next agent with the Trio line',async t=>{
+ let n=0;
+ const {c,runs}=await fixture(t,async()=>{
+  n++;
+  if(n===1)return {text:'x',interrupted:false,denied:'Bash'};
+  return {text:'дальше',interrupted:false};
+ });
+ await c.setFlags({autoReply:true});
+ await c.send('всем','all',['claude','codex']);await c.idle();
+ assert.equal(runs.length,2);
+ assert.match(runs[1].prompt,/не разрешили Bash/);
+});
+test('a failed turn does not start the next message',async t=>{
+ const {c,state,runs}=await fixture(t,async()=>({text:'',error:'лимит',interrupted:false}));
+ await c.setFlags({autoReply:true});
+ await c.send('первый','claude');
+ await c.send('второй','codex');
+ await c.idle();
  assert.equal(runs.length,1);
+ assert.equal(state.turns.find(t=>t.recipient==='codex').status,'proposed');
+});
+test('a repeated agent in one chain is its own turn and sees the previous answer',async t=>{
+ const {c,state,runs}=await fixture(t,withSession);
+ await c.setFlags({autoReply:true});
+ await c.send('всем','all',['codex','claude','codex']);await c.idle();
+ assert.deepEqual(runs.map(r=>r.provider),['codex','claude','codex']);
+ assert.equal(state.turns.length,3);
+ assert.equal(runs[2].session,'session-codex');
+ assert.match(runs[2].prompt,/Ответ claude/);
+});
+test('the responder ceiling comes from the host',async t=>{
+ const {c,host,state}=await fixture(t);
+ host.maxResponders=()=>2;
+ await assert.rejects(c.send('x','all',['claude','codex','grok']),/Не больше 2/);
+ await c.send('двое','all',['claude','codex']);await c.idle();
+ assert.equal(state.turns.length,2);
+});
+test('a stored ceiling above 10 is cut to 10',async t=>{
+ const {c,host}=await fixture(t);
+ host.maxResponders=()=>12;
+ await assert.rejects(c.send('x','all',Array(11).fill('claude')),/Не больше 10/);
+});
+test('a draft order longer than three loads trimmed instead of failing',async t=>{
+ const {store,state}=await fixture(t);
+ await store.save(state);
+ const file=path.join(store.dir,'state.json');
+ const disk=JSON.parse(await fs.readFile(file,'utf8'));
+ disk.responseOrder=[...Array(13).fill('codex'),'nope'];
+ await fs.writeFile(file,JSON.stringify(disk));
+ const loaded=await store.load();
+ assert.equal(loaded.responseOrder.length,10);
+ assert.ok(loaded.responseOrder.every(p=>p==='codex'));
 });
 test('stop everyone turns auto-reply off',async t=>{
  let started;const ready=new Promise(r=>started=r);
@@ -919,6 +1216,7 @@ test('auto-actions allow an execute-mode edit even if the file text mentions bas
   return {text:String(allow),interrupted:false};
  });
  await c.setFlags({autoEdits:true});
+ state.agents.find(a=>a.id==='claude').mode='execute';
  await c.send('Колян, делай правку package.json','claude');await c.idle();
  assert.equal(state.turns[0].mode,'execute');
  assert.ok(state.messages.some(m=>m.text==='Автоправки: Колян'));
@@ -934,6 +1232,7 @@ test('auto-commands allow tests and still ask for git commit',async t=>{
   return {text:String(testRun)+'/'+String(git),interrupted:false};
  });
  await c.setFlags({autoCommands:true});
+ state.agents.find(a=>a.id==='claude').mode='execute';
  await c.send('Колян, делай прогон тестов','claude');await c.idle();
  assert.ok(state.messages.some(m=>m.text==='Автокоманды: Колян'));
  assert.ok(state.messages.some(m=>/Отказано/.test(m.text)&&/git/i.test(m.text)));
@@ -958,6 +1257,7 @@ test('privileges allow a checked git commit and still ask for an unchecked delet
   return {text:String(git)+'/'+String(removed),interrupted:false};
  });
  await c.setFlags({privilegeOn:true,privileges:['git']});
+ state.agents.find(a=>a.id==='claude').mode='execute';
  await c.send('Колян, делай коммит','claude');await c.idle();
  assert.equal(state.turns[0].mode,'execute');
  assert.ok(state.messages.some(m=>m.text==='Автопривилегии: Колян'));
@@ -973,6 +1273,7 @@ test('a chain of an ordinary command and git needs both the checkbox and auto-co
    return {text:String(await decision),interrupted:false};
   });
   await c.setFlags({privilegeOn:true,privileges,autoCommands});
+  state.agents.find(a=>a.id==='claude').mode='execute';
   await c.send('Колян, делай цепочку','claude');await c.idle();
   return state.messages.find(m=>m.author==='Колян').text;
  };
@@ -1159,8 +1460,25 @@ test('the discuss switch keeps execute-mode cards from editing',async t=>{
  assert.match(state.messages[0].text,/обсуждаем, код не трогать/);
  assert.match(runs[0].prompt,/Сейчас обсуждение/);
 });
+test('the discuss line sits above the first pass mark',async t=>{
+ const {c,state,runs}=await fixture(t,async()=>({text:'ok',interrupted:false}));
+ await c.setFlags({autoReply:true});
+ state.agents.forEach(a=>{a.enabled=true;});
+ const text='общие указания\n\n[Проход 1 из 2: Колян]\nсделай\n\n[Проход 2 из 2: Жека]\nпроверь';
+ await c.send(text,'all',['claude','codex'],[],true);await c.idle();
+ const saved=state.messages[0].text;
+ assert.equal(saved,'общие указания\n\nобсуждаем, код не трогать\n\n[Проход 1 из 2: Колян]\nсделай\n\n[Проход 2 из 2: Жека]\nпроверь');
+ assert.equal(runs.length,2);
+ for (const run of runs) {
+  const note=run.prompt.indexOf('обсуждаем, код не трогать');
+  const mark=run.prompt.indexOf('[Проход 1 из 2: Колян]');
+  assert.ok(note>=0 && mark>note);
+  assert.equal(run.execute,false);
+ }
+});
 test('an extra opinion on an execution request is read-only and adds no invented human message',async t=>{
  const {c,state,runs}=await fixture(t);
+ state.agents.find(a=>a.id==='claude').mode='execute';
  await c.send('Колян, исправь файл','all');await c.idle();
  assert.equal(runs[0].execute,true);
  await c.handoff('codex');await c.idle();
@@ -1658,6 +1976,209 @@ test('recovery after a closed window removes a leftover summary source',async t=
 test('.trio-summary.md is ignored by git',()=>{
  assert.match(require('fs').readFileSync(path.join(__dirname,'..','.gitignore'),'utf8'),/^\.trio-summary\.md\*$/m);
 });
+test('the privilege journal is ignored by git and omitted from the package',()=>{
+ const root=path.join(__dirname,'..');
+ assert.match(require('fs').readFileSync(path.join(root,'.gitignore'),'utf8'),/^\.trio-privileges\.jsonl$/m);
+ assert.match(require('fs').readFileSync(path.join(root,'.vscodeignore'),'utf8'),/^\.trio-privileges\.jsonl$/m);
+});
+test('a privilege journal hit keeps the command name and drops its arguments',()=>{
+ const secret='SECRETTOKEN';
+ const shell=privilegeJournalHit('Bash',JSON.stringify({kind:'execute',rawInput:{command:'powershell -EncodedCommand '+secret}}));
+ assert.equal(shell.privilege,'unparsed');
+ assert.equal(shell.word,'powershell');
+ assert.equal(shell.reason,'обёртка');
+ assert.equal(JSON.stringify(shell).includes(secret),false);
+ const loose=privilegeJournalHit('Bash',JSON.stringify({kind:'execute',rawInput:{command:'curl $('+secret+')'}}));
+ assert.equal(loose.privilege,'unparsed');
+ assert.equal(loose.word,'curl');
+ assert.equal(loose.reason,'$()');
+ assert.equal(JSON.stringify(loose).includes(secret),false);
+ const named=privilegeJournalHit('MysteryTool',JSON.stringify({name:'MysteryTool',token:secret}));
+ assert.equal(named.privilege,'other');
+ assert.equal(named.word,'mysterytool');
+ assert.equal(named.reason,'прочее');
+ assert.equal(privilegeJournalHit('Execute git',JSON.stringify({kind:'execute',rawInput:{command:'git commit -m '+secret}})),undefined);
+});
+test('a visible command head keeps its checkbox and the journal says why the rest is unparsed',()=>{
+ const cover=command=>dangerCover('Bash',JSON.stringify({kind:'execute',command}));
+ const hit=command=>privilegeJournalHit('Bash',JSON.stringify({kind:'execute',rawInput:{command}}));
+ const here="@'\n$(Remove-Item hidden)\n'@\nRemove-Item a.txt";
+ assert.deepEqual(cover(here),{needs:['shell'],safeCommand:false});
+ assert.equal(hit(here),undefined);
+ const literal="$layout = @'\nconst q = $('x');\n'@\n$layout | node";
+ assert.equal(permissionClass('Bash',JSON.stringify({kind:'execute',command:literal})),'command');
+ assert.deepEqual(cover('Remove-Item a.txt; python script.py'),{needs:['shell'],safeCommand:true});
+ assert.equal(hit('Remove-Item a.txt; python script.py'),undefined);
+ assert.equal(permissionClass('Bash',JSON.stringify({kind:'execute',command:'python script.py SECRETTOKEN'})),'command');
+ assert.equal(hit('python script.py SECRETTOKEN'),undefined);
+ for (const command of ['python -m pytest','python3 script.py','py -3 script.py','pythonw script.py']) {
+  assert.equal(permissionClass('Bash',JSON.stringify({kind:'execute',command})),'command',command);
+  assert.equal(hit(command),undefined,command);
+ }
+ assert.deepEqual(cover('curl $(https://example.test)'),{needs:['network','unparsed'],safeCommand:false});
+ assert.equal(hit('curl $(https://example.test)').reason,'$()');
+ assert.deepEqual(cover('Remove-Item $(path)'),{needs:['shell','unparsed'],safeCommand:false});
+ assert.equal(hit('Remove-Item $(path)').word,'remove-item');
+ assert.equal(hit('echo $(Remove-Item a.txt)').reason,'$()');
+ assert.deepEqual(cover('echo $(Remove-Item a.txt)'),{needs:['unparsed'],safeCommand:false});
+ assert.equal(hit('Get-ChildItem ${name}').reason,'${}');
+ assert.equal(hit('Get-ChildItem ${name}').word,'get-childitem');
+ const called='& "C:\\\\Program Files\\\\python.exe" script.py';
+ assert.equal(permissionClass('Bash',JSON.stringify({kind:'execute',command:called})),'command');
+ assert.equal(hit(called),undefined);
+ assert.deepEqual(cover('& { Remove-Item a.txt }'),{needs:['unparsed'],safeCommand:false});
+ assert.equal(hit('& { Remove-Item a.txt }').reason,'&');
+ assert.deepEqual(cover('powershell -Command "Remove-Item a.txt"'),{needs:['shell'],safeCommand:false});
+ assert.equal(hit('powershell -Command "Remove-Item a.txt"'),undefined);
+ assert.deepEqual(cover('bash -c "rm a && curl https://example.test"'),{needs:['network','shell'],safeCommand:false});
+ assert.deepEqual(cover('powershell -EncodedCommand abc'),{needs:['unparsed'],safeCommand:false});
+ assert.equal(hit('powershell -EncodedCommand abc').reason,'обёртка');
+ assert.equal(permissionClass('Bash',JSON.stringify({kind:'execute',command:'node -e "git commit && rm -rf /"'})),'command');
+});
+test('a bash quote dressed as a here-string and a script from stdin do not pass as a plain command',()=>{
+ const cover=(command,shell)=>dangerCover('Bash',JSON.stringify({kind:'execute',rawInput:{command},...(shell?{shell}:{})}));
+ // In bash the quote closes at the first apostrophe and rm runs.
+ const fake="echo @'\nfoo' ; rm -rf ~ ; echo '\n'@";
+ assert.deepEqual(cover(fake),{needs:['shell'],safeCommand:true});
+ assert.deepEqual(cover(fake,'bash'),{needs:['shell'],safeCommand:true});
+ assert.equal(permissionSignature('Bash',JSON.stringify({kind:'execute',rawInput:{command:fake}})),undefined);
+ // A real here-string with no shell field still shows the command after it.
+ assert.deepEqual(cover("@'\nsome text\n'@ | Remove-Item a.txt"),{needs:['shell'],safeCommand:false});
+ for (const command of ['echo Remove-Item x | powershell -NoProfile -Command -','Get-Content run.ps1 | pwsh -c -']) {
+  assert.deepEqual(cover(command),{needs:['unparsed'],safeCommand:true},command);
+ }
+ for (const command of ['powershell -Command $script','bash -c "$cmd"']) {
+  assert.deepEqual(cover(command),{needs:['unparsed'],safeCommand:false},command);
+ }
+});
+test('compound wrapper scripts require unparsed without losing visible commands',()=>{
+ for (const command of [
+  "powershell -Command 'if ($true) { Remove-Item a.txt }'",
+  "pwsh -c 'if($true){Remove-Item a.txt}'",
+  "bash -c 'if true; then rm a.txt; fi'",
+  "sh -c 'for f in a.txt; do rm $f; done'",
+  "powershell -Command 'try { Remove-Item a.txt } catch { }'",
+  "bash -c '(rm a.txt)'",
+  "bash -c 'echo \x60rm a.txt\x60'"
+ ]) {
+  const detail=JSON.stringify({kind:'execute',command});
+  assert.equal(permissionClass('Bash',detail),'danger',command);
+  assert.deepEqual(dangerCover('Bash',detail),{needs:['unparsed'],safeCommand:false},command);
+  assert.equal(privilegeJournalHit('Bash',detail).reason,'обёртка',command);
+ }
+ const chain=JSON.stringify({kind:'execute',command:"bash -c 'curl https://example.test; if true; then rm a.txt; fi'"});
+ assert.deepEqual(dangerCover('Bash',chain),{needs:['network','unparsed'],safeCommand:false});
+ const literal=JSON.stringify({kind:'execute',command:'powershell -Command "Write-Output if"'});
+ assert.equal(permissionClass('Bash',literal),'command');
+});
+test('CMD wrapper variables remain opaque including quoted and delayed expansion',()=>{
+ for (const command of ['cmd /c %SCRIPT%','cmd /c "%SCRIPT%"','cmd /c !SCRIPT!','cmd /c %1','cmd /c echo %SCRIPT%']) {
+  const detail=JSON.stringify({kind:'execute',command});
+  assert.deepEqual(dangerCover('Bash',detail),{needs:['unparsed'],safeCommand:false},command);
+  assert.equal(privilegeJournalHit('Bash',detail).reason,'обёртка',command);
+ }
+ assert.equal(permissionClass('Bash',JSON.stringify({kind:'execute',command:'cmd /c echo hello'})),'command');
+});
+test('an ambiguous here-string preserves every known category when bash parsing fails',()=>{
+ const prefix="@'\ncan't\n'@\n";
+ for (const [command,category] of [['Remove-Item a.txt','shell'],['curl https://example.test','network'],['git push','git']]) {
+  const detail=JSON.stringify({kind:'execute',command:prefix+command});
+  assert.deepEqual(dangerCover('Bash',detail),{needs:[category,'unparsed'],safeCommand:false},command);
+  assert.equal(permissionSignature('Bash',detail),undefined);
+ }
+ const chain=JSON.stringify({kind:'execute',command:prefix+'echo ok; Remove-Item a.txt; curl https://example.test; git push'});
+ assert.deepEqual(dangerCover('Bash',chain),{needs:['network','git','shell','unparsed'],safeCommand:true});
+});
+test('auto commands cannot approve opaque wrappers and unparsed alone cannot approve a visible deletion',async t=>{
+ for (const scenario of [
+  {command:"powershell -Command 'if ($true) { Remove-Item a.txt }'",autoCommands:true,privileges:[]},
+  {command:'cmd /c %SCRIPT%',autoCommands:true,privileges:[]},
+  {command:"@'\ncan't\n'@\nRemove-Item a.txt",autoCommands:false,privileges:['unparsed']}
+ ]) {
+  const {command,autoCommands,privileges}=scenario;
+  let pending;
+  const {c,state}=await fixture(t,async o=>{
+   const decision=o.permission('Bash',JSON.stringify({kind:'execute',command}));
+   pending=c.permissions[0];
+   if(pending)c.permission(pending.id,false);
+   return {text:String(await decision),interrupted:false};
+  });
+  await c.setFlags({autoCommands,privilegeOn:true,privileges});
+  state.agents.find(a=>a.id==='claude').mode='execute';
+  await c.send('review','claude');await c.idle();
+  assert.ok(pending,command+' must ask before execution');
+  assert.equal(pending.standing,false,command);
+  assert.ok(state.messages.some(m=>m.text==='false'),command);
+ }
+});
+test('the privilege journal records unparsed and other requests without arguments',async t=>{
+ const secret='SECRETTOKEN';
+ let step=0;
+ const {c,state,host}=await fixture(t,async o=>{
+  step++;
+  if(step>1){
+   const again=await o.permission('Bash',JSON.stringify({kind:'execute',rawInput:{command:'powershell -EncodedCommand '+secret}}));
+   return {text:String(again),interrupted:false};
+  }
+  const shell=o.permission('Bash',JSON.stringify({kind:'execute',rawInput:{command:'python script.py '+secret}}));
+  while(!c.permissions.length)await new Promise(r=>setImmediate(r));
+  c.permission(c.permissions[0].id,true);
+  const ran=await shell;
+  const allow=o.permission('MysteryTool',JSON.stringify({name:'MysteryTool',token:secret}));
+  while(!c.permissions.length)await new Promise(r=>setImmediate(r));
+  c.permission(c.permissions[0].id,true);
+  const allowed=await allow;
+  const deny=o.permission('OddTool',JSON.stringify({tool:'OddTool',password:secret}));
+  while(!c.permissions.length)await new Promise(r=>setImmediate(r));
+  c.permission(c.permissions[0].id,false);
+  const denied=await deny;
+  return {text:[ran,allowed,denied].join('/'),interrupted:false};
+ });
+ await c.setFlags({privilegeOn:true,privileges:['unparsed']});
+ state.agents.find(a=>a.id==='claude').mode='execute';
+ const file=path.join(host.root,privilegeJournalFile);
+ await fs.writeFile(file,'{"at":"old","agent":"Жека","word":"curl","privilege":"unparsed","outcome":"отказ"}','utf8');
+ await c.send('Колян, делай','claude');await c.idle();
+ await c.send('ещё','claude');await c.idle();
+ const text=await fs.readFile(file,'utf8');
+ assert.equal(text.includes('\r'),false);
+ assert.equal(text.includes(secret),false);
+ const rows=text.trim().split('\n').map(line=>JSON.parse(line));
+ assert.deepEqual(rows.map(row=>row.word),['curl','mysterytool','oddtool','powershell']);
+ assert.deepEqual(rows.map(row=>row.outcome),['отказ','разрешено','отказ','само']);
+ assert.deepEqual(rows.map(row=>row.privilege),['unparsed','other','other','unparsed']);
+ assert.deepEqual(rows.map(row=>row.reason),[undefined,'прочее','прочее','обёртка']);
+ assert.equal(rows[1].agent,'Колян');
+ assert.equal(rows[3].agent,'Колян');
+ const notes=state.messages.filter(m=>m.text.startsWith('Журнал привилегий: '));
+ assert.equal(notes.length,2);
+ assert.equal(notes[0].control,true);
+ assert.equal(notes[0].text,'Журнал привилегий: '+file);
+ assert.equal(notes[0].text.includes(secret),false);
+});
+test('a checked git command does not enter the privilege journal',async t=>{
+ const {c,state,host}=await fixture(t,async o=>{
+  const git=await o.permission('Execute git',JSON.stringify({kind:'execute',rawInput:{command:'git commit -m x'}}));
+  return {text:String(git),interrupted:false};
+ });
+ await c.setFlags({privilegeOn:true,privileges:['git']});
+ state.agents.find(a=>a.id==='claude').mode='execute';
+ await c.send('Колян, делай коммит','claude');await c.idle();
+ await assert.rejects(fs.stat(path.join(host.root,privilegeJournalFile)),{code:'ENOENT'});
+ assert.equal(state.messages.some(m=>/Журнал привилегий/.test(m.text)),false);
+});
+test('the privilege journal stays away until privileges are on',async t=>{
+ const {c,state,host}=await fixture(t,async o=>{
+  const decision=o.permission('Bash',JSON.stringify({kind:'execute',rawInput:{command:'powershell -Command dir'}}));
+  while(!c.permissions.length)await new Promise(r=>setImmediate(r));
+  c.permission(c.permissions[0].id,true);
+  return {text:String(await decision),interrupted:false};
+ });
+ state.agents.find(a=>a.id==='claude').mode='execute';
+ await c.send('Колян, делай','claude');await c.idle();
+ await assert.rejects(fs.stat(path.join(host.root,privilegeJournalFile)),{code:'ENOENT'});
+ assert.equal(state.messages.some(m=>/Журнал привилегий/.test(m.text)),false);
+});
 
 
 for(const status of ['completed','failed','interrupted',undefined]) {
@@ -1780,7 +2301,7 @@ test('git global options keep dangerous subcommands behind the git checkbox', ()
  assert.deepEqual(dangerCover('Bash', JSON.stringify({command:'git status & git -C repo push'})), {needs:['git'],safeCommand:true});
 });
 test('opaque shell requests and deletion metadata cannot use ordinary auto approvals', () => {
- for (const command of ['', 'powershell -EncodedCommand abc', 'bash -c "rm a"', 'git --unknown-option push', 'git -C']) {
+ for (const command of ['', 'powershell -EncodedCommand abc', 'git --unknown-option push', 'git -C']) {
   const detail = JSON.stringify({kind:'execute',command});
   assert.equal(permissionClass('Bash',detail),'danger',command);
   assert.deepEqual(dangerCover('Bash',detail),{needs:['unparsed'],safeCommand:false},command);
@@ -1807,6 +2328,7 @@ test('ordinary auto approvals cannot bypass the selected privilege categories', 
    return {text:decisions.join('/'),interrupted:false};
   });
   await c.setFlags({autoCommands:true,autoEdits:true,privilegeOn:true,privileges:checked?['git','unparsed','delete']:['other']});
+  state.agents.find(a=>a.id==='claude').mode='execute';
   await c.send('Колян, делай проверку','claude');await c.idle();
   assert.equal(state.messages.find(m=>m.author==='Колян').text,checked?'true/true/true':'false/false/false');
  }
@@ -1825,7 +2347,195 @@ test('a Codex patch containing deletion and editing requires both permissions', 
    return {text:String(await pending),interrupted:false};
   });
   await c.setFlags({autoEdits,privilegeOn:true,privileges:['delete']});
+  state.agents.find(a=>a.id==='claude').mode='execute';
   await c.send('Колян, делай правку','claude');await c.idle();
   assert.equal(state.messages.find(m=>m.author==='Колян').text,String(autoEdits));
  }
+});
+
+test('words and the discuss phrase do not change the card mode',async t=>{
+ const {c,state,runs}=await fixture(t);
+ state.agents.find(a=>a.id==='claude').mode='execute';
+ await c.send('Колян, исправь файл. обсуждаем, код не трогать','claude');await c.idle();
+ assert.equal(state.turns[0].mode,'execute');
+ assert.equal(runs[0].execute,true);
+ state.agents.find(a=>a.id==='claude').mode='discuss';
+ await c.send('делай','claude');await c.idle();
+ assert.equal(state.turns[1].mode,'discuss');
+ assert.equal(runs[1].execute,false);
+});
+
+test('a click uses the clicked card, and the discuss button keeps the next person in reading',async t=>{
+ const {c,state,runs}=await fixture(t);
+ state.agents.find(a=>a.id==='claude').mode='execute';
+ state.agents.find(a=>a.id==='codex').mode='execute';
+ await c.send('Колян, посмотри файл','claude');await c.idle();
+ assert.equal(runs[0].execute,true);
+ await c.handoff('codex');await c.idle();
+ assert.equal(runs[1].execute,true);
+ assert.equal(state.turns[1].mode,'execute');
+ await c.send('ещё раз','claude',[],[],true);await c.idle();
+ assert.equal(runs[2].execute,false);
+ await c.handoff('codex');await c.idle();
+ assert.equal(runs[3].execute,false);
+});
+
+test('a finished reading turn from the card does not force the next click into reading',async t=>{
+ const {c,state,runs}=await fixture(t);
+ state.agents.find(a=>a.id==='codex').mode='execute';
+ await c.send('вопрос','claude');await c.idle();
+ assert.equal(runs[0].execute,false);
+ await c.handoff('codex');await c.idle();
+ assert.equal(runs[1].execute,true);
+ assert.equal(state.turns[1].mode,'execute');
+});
+
+test('the discuss button keeps the next click in reading when the first card is already reading',async t=>{
+ const {c,state,runs,store}=await fixture(t);
+ state.agents.find(a=>a.id==='claude').mode='discuss';
+ state.agents.find(a=>a.id==='codex').mode='execute';
+ await c.send('посмотри','claude',[],[],true);await c.idle();
+ assert.equal(runs[0].execute,false);
+ assert.equal(state.messages.find(m=>m.author==='Антон').discuss,true);
+ assert.equal((await store.load()).messages.find(m=>m.author==='Антон').discuss,true);
+ await c.handoff('codex');await c.idle();
+ assert.equal(runs[1].execute,false);
+ assert.equal(state.turns[1].mode,'discuss');
+});
+
+test('a card change after the answer does not invent or drop the discuss button',async t=>{
+ const {c,state,runs}=await fixture(t);
+ state.agents.find(a=>a.id==='claude').mode='discuss';
+ state.agents.find(a=>a.id==='codex').mode='execute';
+ await c.send('вопрос','claude');await c.idle();
+ assert.equal(state.messages.find(m=>m.author==='Антон').discuss,false);
+ state.agents.find(a=>a.id==='claude').mode='execute';
+ await c.handoff('codex');await c.idle();
+ assert.equal(runs[1].execute,true);
+ assert.equal(state.turns[1].mode,'execute');
+ state.agents.find(a=>a.id==='claude').mode='execute';
+ await c.send('кнопка','claude',[],[],true);await c.idle();
+ state.agents.find(a=>a.id==='claude').mode='discuss';
+ await c.handoff('codex');await c.idle();
+ assert.equal(runs[3].execute,false);
+ assert.equal(state.turns.at(-1).mode,'discuss');
+});
+
+test('a message saved before the discuss flag still guesses the button from the card',async t=>{
+ const {c,state,runs}=await fixture(t);
+ state.agents.find(a=>a.id==='claude').mode='execute';
+ state.agents.find(a=>a.id==='codex').mode='execute';
+ await c.send('старое','claude',[],[],true);await c.idle();
+ delete state.messages.find(m=>m.author==='Антон').discuss;
+ await c.handoff('codex');await c.idle();
+ assert.equal(runs[1].execute,false);
+ assert.equal(state.turns[1].mode,'discuss');
+});
+
+test('Grok cancelled after a refusal lets the next agent in the same chain start',async t=>{
+ const {c,state,runs}=await fixture(t,async o=>{
+  if(o.provider==='grok')return {text:'Проверяю правки',interrupted:false,cancelled:true,refused:true};
+  return {text:'дальше',interrupted:false};
+ });
+ state.agents.find(a=>a.id==='grok').enabled=true;
+ await c.setFlags({autoReply:true});
+ await c.send('вопрос','all',['grok','claude']);await c.idle();
+ assert.deepEqual(runs.map(r=>r.provider),['grok','claude']);
+ const turn=state.turns.find(t=>t.executor==='grok');
+ assert.equal(turn.status,'interrupted');
+ const reply=state.messages.find(m=>m.author==='Гриха'&&!m.control);
+ assert.equal(reply.text,'Проверяю правки');
+ assert.equal(reply.partial,true);
+ const note=state.messages.find(m=>m.control&&/движок закрыл/.test(m.text));
+ assert.equal(note.text,'Гриха: движок закрыл ход после отказа в действии');
+ assert.equal(note.error,false);
+ assert.equal(note.turn,turn.id);
+ assert.match(runs[1].prompt,/движок закрыл ход после отказа в действии/);
+ assert.equal(state.messages.some(m=>/: остановлен/.test(m.text)),false);
+ assert.equal(state.queue.length,0);
+ assert.equal(state.turns.find(t=>t.recipient==='claude').status,'completed');
+});
+
+test('Grok cancelled without a recorded refusal still hands the same chain to the next agent',async t=>{
+ const {c,state,runs}=await fixture(t,async()=>({text:'кусок',interrupted:false,cancelled:true}));
+ state.agents.find(a=>a.id==='grok').enabled=true;
+ await c.setFlags({autoReply:true});
+ await c.send('вопрос','all',['grok','claude']);await c.idle();
+ const note=state.messages.find(m=>/движок закрыл/.test(m.text));
+ assert.equal(note.text,'Гриха: движок закрыл ход');
+ assert.equal(note.control,true);
+ assert.equal(runs.length,2);
+ assert.equal(state.queue.length,0);
+ assert.equal(state.turns.find(t=>t.executor==='grok').status,'interrupted');
+});
+
+test('an engine cancel on the last step does not start the next message',async t=>{
+ const {c,state,runs}=await fixture(t,async o=>{
+  if(o.provider==='grok')return {text:'кусок',interrupted:false,cancelled:true};
+  return {text:'не должен',interrupted:false};
+ });
+ state.agents.find(a=>a.id==='grok').enabled=true;
+ await c.setFlags({autoReply:true});
+ await c.send('первый','grok');
+ await c.send('второй','claude');
+ await c.idle();
+ assert.equal(runs.length,1);
+ assert.match(state.messages.find(m=>/движок закрыл/.test(m.text)).text,/Очередь остановлена/);
+ assert.equal(state.turns.find(t=>t.recipient==='claude').status,'proposed');
+});
+
+test('Grok cancelled does not mention the queue when nobody is waiting on auto-reply',async t=>{
+ const {c,state}=await fixture(t,async()=>({text:'кусок',interrupted:false,cancelled:true,refused:true}));
+ state.agents.find(a=>a.id==='grok').enabled=true;
+ await c.setFlags({autoReply:true});
+ await c.send('один','grok');await c.idle();
+ assert.equal(state.messages.find(m=>/движок закрыл/.test(m.text)).text,'Гриха: движок закрыл ход после отказа в действии');
+ assert.equal(state.queue.length,0);
+ let release;const hold=new Promise(r=>release=r);
+ const second=await fixture(t,async o=>{
+  if(o.provider==='grok')await hold;
+  return {text:'кусок',interrupted:false,cancelled:true};
+ });
+ second.state.agents.find(a=>a.id==='grok').enabled=true;
+ await second.c.send('первый','grok');
+ await second.c.send('второй','claude');
+ release();
+ await second.c.idle();
+ assert.equal(second.state.messages.find(m=>/движок закрыл/.test(m.text)).text,'Гриха: движок закрыл ход');
+ assert.equal(second.state.queue.length,1);
+});
+
+test('an empty Grok cancel is interrupted without an empty-answer error',async t=>{
+ const {c,state}=await fixture(t,async()=>({text:'',interrupted:false,cancelled:true,refused:true}));
+ state.agents.find(a=>a.id==='grok').enabled=true;
+ await c.send('пусто','grok');await c.idle();
+ assert.equal(state.messages.some(m=>m.author==='Гриха'),false);
+ assert.equal(state.messages.some(m=>/пустой ответ/.test(m.text)),false);
+ assert.equal(state.turns[0].status,'interrupted');
+ assert.equal(state.messages.find(m=>m.control).text,'Гриха: движок закрыл ход после отказа в действии');
+ assert.equal(state.messages.some(m=>/остановлен/.test(m.text)),false);
+});
+
+test('Anton Stop still says остановлен when the engine also reports cancelled',async t=>{
+ let started;const ready=new Promise(r=>started=r);
+ const {c,state}=await fixture(t,async o=>{
+  started();
+  await new Promise(r=>o.signal.addEventListener('abort',r,{once:true}));
+  return {text:'частично',interrupted:true,cancelled:true,refused:true};
+ });
+ state.agents.find(a=>a.id==='grok').enabled=true;
+ await c.send('вопрос','grok');await ready;
+ await c.stop('grok');
+ assert.match(state.messages.at(-1).text,/Гриха: остановлен\. Частичный ответ сохранён\./);
+ assert.equal(state.messages.some(m=>/движок закрыл/.test(m.text)),false);
+ assert.equal(state.turns[0].status,'interrupted');
+ assert.equal(state.messages.find(m=>m.author==='Гриха').partial,true);
+});
+
+test('a denied command stays the failure note even if the engine also cancelled',async t=>{
+ const {c,state}=await fixture(t,async()=>({text:'x',interrupted:false,denied:'Bash',cancelled:true,refused:true}));
+ await c.send('команда','claude');await c.idle();
+ assert.equal(state.turns[0].status,'failed');
+ assert.match(state.messages.find(m=>m.control).text,/остановился: не разрешили Bash/);
+ assert.equal(state.messages.some(m=>/движок закрыл|остановлен/.test(m.text)),false);
 });

@@ -20,7 +20,9 @@ export interface RunOptions {
   notice?(title: string, detail?: string): void;
   activity?(): void;
 }
-export interface RunResult {text: string; error?: string; interrupted: boolean; stderr?: string; denied?: string}
+export interface RunResult {text: string; error?: string; interrupted: boolean; stderr?: string; denied?: string;
+  // Grok closed the prompt with stopReason cancelled, and Anton did not press Stop.
+  cancelled?: boolean; refused?: boolean}
 // What the engine reported about its own window. `tokens` is the occupancy after the turn,
 // never the spend of the turn: those differ by an order of magnitude once a cache is reused.
 // `raw` goes to diagnostics untouched, so a changed payload is visible instead of guessed.
@@ -1159,7 +1161,7 @@ async function codex(o: RunOptions): Promise<RunResult> {
 async function grok(o: RunOptions): Promise<RunResult> {
   const launch = await resolveCli(o.cli);
   let closing = false;
-  let rpc: Rpc, text = '', error = '', session = '', accepting = false, newStage = false;
+  let rpc: Rpc, text = '', error = '', session = '', accepting = false, newStage = false, refused = false, stop = '';
   const compacted = compactOnce(o);
   const tracer = makeTracer(o);
   o.progress('Гриха: запуск агента');
@@ -1219,6 +1221,7 @@ async function grok(o: RunOptions): Promise<RunResult> {
       const pick = (kinds: string[]) => options.find(x => kinds.includes(x?.kind))?.optionId;
       // Prefer the single-use answer. A standing grant lives in Trio, not in the CLI, so it can be revoked on reset.
       const allow = o.execute && await o.permission(p?.toolCall?.title || 'Действие агента', JSON.stringify(p?.toolCall ?? p, null, 2));
+      if (!allow) refused = true;
       const chosen = allow ? pick(['allow_once', 'allow_always']) : pick(['reject_once', 'reject_always']);
       return chosen ? {outcome: {outcome: 'selected', optionId: chosen}} : {outcome: {outcome: 'cancelled'}};
     }
@@ -1255,12 +1258,15 @@ async function grok(o: RunOptions): Promise<RunResult> {
     const spent = result?._meta ?? result;
     o.usage?.({tokens: number(spent?.totalTokens), spent: spendTokens('grok', spent), spentHint: spendHint('grok', spent), raw: spent}, 'session/prompt');
     await grokQuotaAfterTurn(rpc, o);
-    const stop = result?.stopReason;
+    stop = typeof result?.stopReason === 'string' ? result.stopReason : '';
     if (stop && !['end_turn', 'cancelled'].includes(stop) && !isAutoCompact('', {type: stop}))
       error = 'Ход завершён: ' + stop;
   } catch (e) {error = String(e);}
   finally {tracer.finish(); accepting = false; closing = true; await channel.close();}
-  return {text, error: o.signal.aborted ? undefined : error || (!text.trim() ? 'Grok вернул пустой ответ.' : undefined), interrupted: o.signal.aborted, stderr: channel.stderr};
+  const engineCancelled = stop === 'cancelled' && !o.signal.aborted;
+  return {text,
+    error: o.signal.aborted || engineCancelled ? undefined : error || (!text.trim() ? 'Grok вернул пустой ответ.' : undefined),
+    interrupted: o.signal.aborted, cancelled: engineCancelled || undefined, refused: refused || undefined, stderr: channel.stderr};
 }
 async function claude(o: RunOptions): Promise<RunResult> {
   const launch = await resolveCli(o.cli);
